@@ -1,5 +1,5 @@
 # ============================================================================
-# ARQUIVO: app.py (Versão 8.0 — Regularize Assessoria Rural)
+# ARQUIVO: app.py (Versão 9.0 — Regularize Assessoria Rural)
 # O QUE ESTE ARQUIVO FAZ:
 #   Sistema web multiusuário em Português do Brasil (PT-BR) conectado ao
 #   PostgreSQL (Supabase), com:
@@ -27,6 +27,7 @@ import io
 import json
 import re
 import secrets
+import unicodedata
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
@@ -424,6 +425,34 @@ def normalizar_espacos(texto):
     return re.sub(r"\s+", " ", str(texto or "").strip())
 
 
+def chave_alfabetica_ptbr(texto):
+    """Chave de ordenação alfabética em Português do Brasil (ignora acentos e maiúsculas)."""
+    norm = unicodedata.normalize("NFKD", str(texto or "").strip())
+    sem_acento = "".join(ch for ch in norm if not unicodedata.combining(ch))
+    return sem_acento.lower()
+
+
+def ordenar_alfabetico_ptbr(itens, manter_no_fim=()):
+    """Ordena uma lista em ordem alfabética A–Z (PT-BR), sem duplicar e mantendo itens especiais no final."""
+    finais_upper = {str(x).strip().upper() for x in manter_no_fim}
+    vistos = set()
+    principais = []
+    finais = []
+    for item in itens:
+        txt = str(item or "").strip()
+        if not txt:
+            continue
+        chave = txt.upper()
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        if chave in finais_upper:
+            finais.append(txt)
+        else:
+            principais.append(txt)
+    return sorted(principais, key=chave_alfabetica_ptbr) + sorted(finais, key=chave_alfabetica_ptbr)
+
+
 def num_float_ou_none(valor):
     if valor is None or str(valor).strip() == "":
         return None
@@ -521,19 +550,13 @@ def carregar_listas_auxiliares():
                 "itens": listas_db.get("ITEM", []),
             }
 
-    def _unir(padrao, extras):
-        vistos = set()
-        saida = []
-        for x in list(padrao) + list(extras):
-            xn = normalizar_espacos(x)
-            if xn and xn.upper() not in vistos:
-                vistos.add(xn.upper())
-                saida.append(xn)
-        return saida
+    def _unir(padrao, extras, manter_no_fim=()):
+        combinados = [normalizar_espacos(x) for x in (list(padrao) + list(extras)) if str(x or "").strip()]
+        return ordenar_alfabetico_ptbr(combinados, manter_no_fim=manter_no_fim)
 
     listas_finais = {
         "CARENCIA": _unir(CARENCIAS_PADRAO, listas_db.get("CARENCIA", [])),
-        "CULTURA": _unir(CULTURAS_MG, listas_db.get("CULTURA", [])),
+        "CULTURA": _unir(CULTURAS_MG, listas_db.get("CULTURA", []), manter_no_fim=("OUTRA CULTURA / ATIVIDADE",)),
         "BANCO": _unir(BANCOS_PADRAO, listas_db.get("BANCO", [])),
         "TIPO_CLIENTE": _unir(TIPOS_CLIENTE_PADRAO, listas_db.get("TIPO_CLIENTE", [])),
         "TIPO_CREDITO": _unir(TIPOS_CREDITO_PESSOAL_PADRAO, listas_db.get("TIPO_CREDITO", [])),
@@ -1455,7 +1478,8 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
                 f"{r['nome']} | {fmt_doc(r['cpf_cnpj'])} {('(' + r['cidade'] + ')') if r['cidade'] else ''}".strip(): r["cpf_cnpj"]
                 for _, r in df_encontrados.iterrows()
             }
-            escolhido = st.selectbox("Selecione o cliente encontrado:", list(opcoes_cli.keys()))
+            chaves_cli_ord = ordenar_alfabetico_ptbr(list(opcoes_cli.keys()))
+            escolhido = st.selectbox("Selecione o cliente encontrado:", chaves_cli_ord)
             st.button(
                 "📥 Carregar Dados e Imóveis deste Cliente",
                 on_click=cb_carregar_cliente,
@@ -1473,9 +1497,10 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
     c3.text_input("Parceiro / Escritório", key=preparar_widget("parceiro"), on_change=cb_sync_campo, args=("parceiro",))
 
     b1, b2 = st.columns([1.4, 2.6])
-    bancos_lista = [""] + listas_cat["BANCO"]
-    if st.session_state["banco_destino"] and st.session_state["banco_destino"] not in bancos_lista:
-        bancos_lista.append(st.session_state["banco_destino"])
+    bancos_raw = list(listas_cat["BANCO"])
+    if st.session_state["banco_destino"]:
+        bancos_raw.append(st.session_state["banco_destino"])
+    bancos_lista = [""] + ordenar_alfabetico_ptbr(bancos_raw)
     b1.selectbox(
         "Banco / Cooperativa de Destino",
         bancos_lista,
@@ -1484,9 +1509,10 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
         args=("banco_destino",),
     )
 
-    opcoes_mun_banco = [""] + MUNICIPIOS_BANCOS_150KM_DIVINO + ["OUTRO MUNICÍPIO (DIGITAR MANUALMENTE)"]
-    if st.session_state["banco_municipio"] and st.session_state["banco_municipio"] not in opcoes_mun_banco:
-        opcoes_mun_banco.insert(1, st.session_state["banco_municipio"])
+    muns_raw = list(MUNICIPIOS_BANCOS_150KM_DIVINO)
+    if st.session_state["banco_municipio"] and st.session_state["banco_municipio"] != "OUTRO MUNICÍPIO (DIGITAR MANUALMENTE)":
+        muns_raw.append(st.session_state["banco_municipio"])
+    opcoes_mun_banco = [""] + ordenar_alfabetico_ptbr(muns_raw) + ["OUTRO MUNICÍPIO (DIGITAR MANUALMENTE)"]
     b2.selectbox(
         "Município do Banco / Cooperativa (raio de 150 km de Divino - MG)",
         opcoes_mun_banco,
@@ -1514,9 +1540,10 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
         args=("cliente_cpf", True),
     )
     p3.text_input("Telefone / WhatsApp", key=preparar_widget("cliente_telefone"), on_change=cb_sync_campo, args=("cliente_telefone",))
-    tipos_cli = [""] + listas_cat["TIPO_CLIENTE"]
-    if st.session_state["tipo_cliente"] and st.session_state["tipo_cliente"] not in tipos_cli:
-        tipos_cli.append(st.session_state["tipo_cliente"])
+    tcli_raw = list(listas_cat["TIPO_CLIENTE"])
+    if st.session_state["tipo_cliente"]:
+        tcli_raw.append(st.session_state["tipo_cliente"])
+    tipos_cli = [""] + ordenar_alfabetico_ptbr(tcli_raw)
     p4.selectbox(
         "Tipo de Cliente",
         tipos_cli,
@@ -1549,10 +1576,10 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
 
     # Imóvel Beneficiado
     props_atuais = st.session_state.get("propriedades_lista", [])
-    opcoes_imov = [
+    opcoes_imov = ordenar_alfabetico_ptbr([
         f"{p['nome']} Mat {p['matricula']}".strip() if p.get("matricula") else p.get("nome", "")
         for p in props_atuais if p.get("nome")
-    ]
+    ])
     im1, im2 = st.columns([2, 1.5])
     im1.text_input(
         "Imóvel Beneficiado (Nome + Matrícula)",
@@ -1571,7 +1598,7 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
     # OPERAÇÃO DE CRÉDITO
     st.markdown("#### 💰 Operação de Crédito, Linha, Itens Financiáveis e Culturas (MG)")
 
-    linhas_disponiveis = ["TODAS AS LINHAS"] + sorted({v["linha"] for v in catalogo_servicos.values()})
+    linhas_disponiveis = ["TODAS AS LINHAS"] + ordenar_alfabetico_ptbr({v["linha"] for v in catalogo_servicos.values()})
     fl1, fl2 = st.columns([1.2, 2.8])
     fl1.selectbox(
         "Filtrar por Linha de Crédito",
@@ -1583,9 +1610,9 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
     linha_filtro = st.session_state["filtro_linha_credito"]
 
     if linha_filtro == "TODAS AS LINHAS":
-        servicos_filtrados = [""] + list(catalogo_servicos.keys())
+        servicos_filtrados = [""] + ordenar_alfabetico_ptbr(list(catalogo_servicos.keys()))
     else:
-        servicos_filtrados = [""] + [k for k, v in catalogo_servicos.items() if v["linha"] == linha_filtro]
+        servicos_filtrados = [""] + ordenar_alfabetico_ptbr([k for k, v in catalogo_servicos.items() if v["linha"] == linha_filtro])
 
     if st.session_state["tipo_servico"] not in servicos_filtrados:
         definir_campo("tipo_servico", "")
@@ -1602,10 +1629,10 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
 
     op1, op2, op3 = st.columns(3)
     info_serv_atual = catalogo_servicos.get(st.session_state["tipo_servico"], {})
-    itens_da_linha = list(info_serv_atual.get("itens", [])) if info_serv_atual else listas_cat["TODOS_ITENS"]
-    opcoes_item = [""] + itens_da_linha + ["OUTRO ITEM (DIGITAR MANUALMENTE)"]
-    if st.session_state["item_financiado"] and st.session_state["item_financiado"] not in opcoes_item:
-        opcoes_item.insert(1, st.session_state["item_financiado"])
+    itens_da_linha = list(info_serv_atual.get("itens", [])) if info_serv_atual else list(listas_cat["TODOS_ITENS"])
+    if st.session_state["item_financiado"] and st.session_state["item_financiado"] != "OUTRO ITEM (DIGITAR MANUALMENTE)":
+        itens_da_linha.append(st.session_state["item_financiado"])
+    opcoes_item = [""] + ordenar_alfabetico_ptbr(itens_da_linha) + ["OUTRO ITEM (DIGITAR MANUALMENTE)"]
 
     op1.selectbox(
         "Item Financiável desta Linha",
@@ -1622,9 +1649,10 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
             args=("item_financiado_custom",),
         )
 
-    lista_cult = [""] + listas_cat["CULTURA"]
-    if st.session_state["cultura"] and st.session_state["cultura"] not in lista_cult:
-        lista_cult.append(st.session_state["cultura"])
+    cult_raw = list(listas_cat["CULTURA"])
+    if st.session_state["cultura"]:
+        cult_raw.append(st.session_state["cultura"])
+    lista_cult = [""] + ordenar_alfabetico_ptbr(cult_raw, manter_no_fim=("OUTRA CULTURA / ATIVIDADE",))
     op2.selectbox(
         "Cultura / Atividade Principal (Minas Gerais)",
         lista_cult,
@@ -1633,9 +1661,10 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
         args=("cultura",),
     )
 
-    lista_car = [""] + listas_cat["CARENCIA"]
-    if st.session_state["carencia"] and st.session_state["carencia"] not in lista_car:
-        lista_car.append(st.session_state["carencia"])
+    car_raw = list(listas_cat["CARENCIA"])
+    if st.session_state["carencia"]:
+        car_raw.append(st.session_state["carencia"])
+    lista_car = [""] + ordenar_alfabetico_ptbr(car_raw)
     op3.selectbox(
         "Carência",
         lista_car,
@@ -1656,10 +1685,11 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
         placeholder="",
     )
 
-    nomes_cont = [""] + df_contabilidades["nome"].tolist()
+    cont_raw = df_contabilidades["nome"].tolist()
     mapa_cnpj = dict(zip(df_contabilidades["nome"], df_contabilidades["cnpj"]))
-    if st.session_state["contabilidade_nome"] and st.session_state["contabilidade_nome"] not in nomes_cont:
-        nomes_cont.append(st.session_state["contabilidade_nome"])
+    if st.session_state["contabilidade_nome"]:
+        cont_raw.append(st.session_state["contabilidade_nome"])
+    nomes_cont = [""] + ordenar_alfabetico_ptbr(cont_raw)
     op5.selectbox(
         "Contabilidade do Produtor",
         nomes_cont,
@@ -1689,9 +1719,10 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
             if wk not in st.session_state:
                 st.session_state[wk] = bool(chk.get(chave, False))
             chk[chave] = st.checkbox(doc_nome, key=wk)
-        lista_envio = [""] + listas_cat["TIPO_ENVIO"]
-        if st.session_state["tipo_envio_docs"] and st.session_state["tipo_envio_docs"] not in lista_envio:
-            lista_envio.append(st.session_state["tipo_envio_docs"])
+        envio_raw = list(listas_cat["TIPO_ENVIO"])
+        if st.session_state["tipo_envio_docs"]:
+            envio_raw.append(st.session_state["tipo_envio_docs"])
+        lista_envio = [""] + ordenar_alfabetico_ptbr(envio_raw)
         st.selectbox(
             "Tipo de Envio dos Documentos",
             lista_envio,
@@ -1730,7 +1761,7 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
             ]
         st.multiselect(
             "Modalidade (marca com X no PDF — deixe vazio para marcar à mão na impressão)",
-            options=TIPOS_CREDITO_PESSOAL_PADRAO,
+            options=ordenar_alfabetico_ptbr(TIPOS_CREDITO_PESSOAL_PADRAO),
             key=wk_mods,
             on_change=cb_sync_campo,
             args=("credito_modalidades",),
@@ -1916,7 +1947,10 @@ elif aba_ativa == "🧾 3. Ordem de Serviço & LGPD":
         definir_campo("desconto_extra", None)
 
     os1, os2, os3 = st.columns([2.2, 1.1, 1.1])
-    opcoes_faixa_chaves = list(FAIXAS_HONORARIOS.keys())
+    opcoes_faixa_chaves = sorted(
+        list(FAIXAS_HONORARIOS.keys()),
+        key=lambda k: chave_alfabetica_ptbr(FAIXAS_HONORARIOS[k]["rotulo"]),
+    )
     os1.selectbox(
         "Faixa de Honorários (Define a porcentagem de desconto)",
         options=opcoes_faixa_chaves,
@@ -2039,10 +2073,12 @@ elif aba_ativa == "🖨️ 4. Imprimir / PDFs (P&B)":
 
         with col_pac:
             st.markdown("### 📦 Pacote Completo por Instituição")
-            banco_pacote = st.selectbox("Escolha o Pacote Bancário:", list(PACOTES_BANCOS.keys()))
+            opcoes_pacotes_ord = ordenar_alfabetico_ptbr(list(PACOTES_BANCOS.keys()))
+            banco_pacote = st.selectbox("Escolha o Pacote Bancário:", opcoes_pacotes_ord)
+            opcoes_docs_cli_ord = ordenar_alfabetico_ptbr(DOCUMENTOS_CLIENTE_PADRAO + ["GALPÃO DE GRÃOS"])
             incluir_abas_cliente = st.multiselect(
                 "Quais documentos do cliente incluir no início do pacote?",
-                options=DOCUMENTOS_CLIENTE_PADRAO + ["GALPÃO DE GRÃOS"],
+                options=opcoes_docs_cli_ord,
                 default=DOCUMENTOS_CLIENTE_PADRAO,
             )
             incluir_aval = st.checkbox(
@@ -2071,7 +2107,7 @@ elif aba_ativa == "🖨️ 4. Imprimir / PDFs (P&B)":
 
         with col_ind:
             st.markdown("### 📄 Documento Individual (1 Folha A4)")
-            doc_avulso = st.selectbox("Escolha qualquer um dos 23 documentos:", TODOS_OS_DOCUMENTOS)
+            doc_avulso = st.selectbox("Escolha qualquer um dos 23 documentos:", ordenar_alfabetico_ptbr(TODOS_OS_DOCUMENTOS))
             pdf_avulso = gerar_pdf_bytes(d_pdf, [doc_avulso])
             st.download_button(
                 label=f"📥 Baixar PDF Individual (P&B) — {doc_avulso}",
@@ -2089,7 +2125,7 @@ elif aba_ativa == "🗂️ 5. Histórico & Cadastros":
     st.subheader("🗂️ Histórico de Propostas Salvas")
     f1, f2, f3 = st.columns([2, 1.5, 1])
     busca_hist = f1.text_input("Filtrar por Nome ou CPF/CNPJ:", placeholder="")
-    banco_hist = f2.selectbox("Filtrar por Banco:", ["TODOS"] + listas_cat["BANCO"])
+    banco_hist = f2.selectbox("Filtrar por Banco:", ["TODOS"] + ordenar_alfabetico_ptbr(listas_cat["BANCO"]))
     limite_hist = f3.number_input("Máximo de registros", min_value=20, max_value=2000, value=200, step=50)
 
     ver_todos = tem_permissao("ver_historico_todos")
@@ -2154,10 +2190,11 @@ elif aba_ativa == "🗂️ 5. Histórico & Cadastros":
 
         c_load, c_exp = st.columns([2, 1])
         op_props = {
-            f"#{r['id']} | {pd.to_datetime(r['data_proposta']).strftime('%d/%m/%Y')} | {r['cliente']} {('(' + r['banco'] + ')') if r['banco'] else ''} {fmt_moeda(r['valor_proposto'])}".strip(): int(r["id"])
+            f"{r['cliente']} | #{r['id']} | {pd.to_datetime(r['data_proposta']).strftime('%d/%m/%Y')} {('(' + r['banco'] + ')') if r['banco'] else ''} {fmt_moeda(r['valor_proposto'])}".strip(): int(r["id"])
             for _, r in df_hist.iterrows()
         }
-        prop_sel = c_load.selectbox("Abrir proposta do histórico para editar ou reimprimir:", list(op_props.keys()))
+        chaves_props_ord = ordenar_alfabetico_ptbr(list(op_props.keys()))
+        prop_sel = c_load.selectbox("Abrir proposta do histórico para editar ou reimprimir:", chaves_props_ord)
         c_load.button(
             "📂 Carregar Proposta Selecionada",
             on_click=cb_carregar_proposta,
@@ -2263,11 +2300,12 @@ elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
     # ========================================================================
     with col_add_u:
         st.markdown("### ➕ Adicionar Novo Usuário")
+        perfis_ord_chaves = ordenar_alfabetico_ptbr(list(PERFIS_AUTORIZACAO.keys()))
         perfil_novo = st.selectbox(
             "Perfil de Autorização do Novo Usuário",
-            options=list(PERFIS_AUTORIZACAO.keys()),
+            options=perfis_ord_chaves,
             format_func=lambda k: f"{k} — {PERFIS_AUTORIZACAO[k]['rotulo']}",
-            index=list(PERFIS_AUTORIZACAO.keys()).index("ATENDENTE"),
+            index=perfis_ord_chaves.index("ATENDENTE"),
             key="adm_novo_perfil",
         )
         perms_modelo_novo = dict(PERFIS_AUTORIZACAO[perfil_novo]["permissoes"])
@@ -2349,7 +2387,7 @@ elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
         if df_users.empty:
             st.caption("Cadastre o primeiro usuário ao lado.")
         else:
-            lista_emails_u = df_users["email"].tolist()
+            lista_emails_u = ordenar_alfabetico_ptbr(df_users["email"].tolist())
             email_sel = st.selectbox("Selecione o usuário para configurar:", lista_emails_u, key="adm_edit_sel")
             u_edit = carregar_usuario_db(email_sel)
 
@@ -2358,7 +2396,7 @@ elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
                 if eh_sel_master:
                     st.info("👑 **Conta ADMIN MASTER:** protegida contra desativação, exclusão ou remoção de permissões. Você pode alterar o nome ou redefinir a senha abaixo.")
 
-                op_perfis = list(PERFIS_AUTORIZACAO.keys())
+                op_perfis = ordenar_alfabetico_ptbr(list(PERFIS_AUTORIZACAO.keys()))
                 idx_p_u = op_perfis.index(u_edit["perfil"]) if u_edit["perfil"] in op_perfis else op_perfis.index("PERSONALIZADO")
                 perfil_edit = st.selectbox(
                     "Alterar Perfil Base (atualiza as sugestões abaixo):",
