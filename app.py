@@ -1,16 +1,19 @@
 # ============================================================================
-# ARQUIVO: app.py (Versão 2.0 — Regularize Assessoria Rural)
+# ARQUIVO: app.py (Versão 4.0 — Regularize Assessoria Rural)
 # O QUE ESTE ARQUIVO FAZ:
 #   Sistema web multiusuário em Português do Brasil (PT-BR) conectado ao
 #   PostgreSQL (Supabase), com:
+#   - Campos vazios 100% em branco (sem 0, sem R$ 0,00, sem traços ou máscaras vazias)
+#   - Termo de Proteção de Dados (LGPD) sem trecho de Gov.br e constando
+#     "Instituições financeiras e cooperativas de crédito"
 #   - Busca de CEP corrigida (ViaCEP + BrasilAPI + OpenCEP) puxando Rua/Bairro/Cidade/UF
 #   - Formatação automática de CPF (000.000.000-00) e CNPJ (00.000.000/0000-00)
-#   - Carência com opção de 1 ano, 2 anos e 3 anos
-#   - Principais culturas de Minas Gerais
+#   - Carência de 1 ano, 2 anos e 3 anos + Principais culturas de Minas Gerais
 #   - Linhas de crédito com filtro automático de itens financiáveis e descrições completas
-#   - Margem de Crédito Pessoal e Avalistas em blocos separados + Parecer da Agência
-#   - Ordem de Serviço exibindo Valor Cheio (2,00%) e Desconto Concedido da Faixa
-#   - Impressão 100% em Preto e Branco, 1 folha A4 por documento e marca d'água Regularize
+#   - Margem de Crédito Pessoal e Avalistas separados + Parecer da Agência
+#   - Ordem de Serviço com Valor Cheio (2,00%) + Desconto Concedido da Faixa
+#   - PDFs em Preto e Branco com margens confortáveis, 1 folha A4 equilibrada
+#     por documento e marca d'água oficial da Regularize embutida
 #
 #   Você NÃO precisa mexer neste arquivo!
 #   - Para alterar dados da empresa/taxas/culturas/linhas: edite config.py
@@ -71,7 +74,6 @@ def conectar_banco():
         st.stop()
 
     url = st.secrets["DATABASE_URL"]
-    # Garante uso do driver psycopg (versão 3) compatível com Python 3.12 / 3.13 / 3.14
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg://", 1)
 
@@ -82,7 +84,6 @@ def conectar_banco():
         max_overflow=10,
     )
 
-    # Atualiza silenciosamente colunas novas no banco existente (sem risco aos dados antigos!)
     try:
         with eng.begin() as conn:
             conn.execute(text("ALTER TABLE propostas ADD COLUMN IF NOT EXISTS parecer_agencia TEXT DEFAULT ''"))
@@ -94,7 +95,6 @@ def conectar_banco():
                 "ON CONFLICT (categoria, valor) DO NOTHING"
             ))
     except Exception:
-        # Se as tabelas ainda não foram criadas, o erro aparecerá de forma clara adiante
         pass
 
     return eng
@@ -137,7 +137,7 @@ usuario_atual = verificar_login()
 
 
 # ============================================================================
-# 4. FUNÇÕES AUXILIARES (CPF/CNPJ, CEP MULTI-PROVEDOR E BANCO)
+# 4. FUNÇÕES AUXILIARES (CPF/CNPJ, CEP MULTI-PROVEDOR E CONVERSÃO LIMPA)
 # ============================================================================
 def apenas_digitos(valor):
     return re.sub(r"\D", "", str(valor or ""))
@@ -147,18 +147,36 @@ def normalizar_espacos(texto):
     return re.sub(r"\s+", " ", str(texto or "").strip())
 
 
+def num_float_ou_none(valor):
+    """Retorna float > 0 ou None (mantém campos vazios 100% em branco na tela)."""
+    if valor is None or str(valor).strip() == "":
+        return None
+    try:
+        v = float(valor)
+        return v if abs(v) > 1e-9 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def num_int_ou_none(valor):
+    """Retorna int > 0 ou None (mantém campos inteiros vazios 100% em branco na tela)."""
+    if valor is None or str(valor).strip() == "":
+        return None
+    try:
+        v = int(float(valor))
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def buscar_cep_online(cep_texto):
-    """
-    Consulta o CEP em até 3 serviços gratuitos brasileiros (ViaCEP -> BrasilAPI -> OpenCEP).
-    Retorna dicionário padronizado {'rua', 'bairro', 'cidade', 'uf', 'cep'} ou None.
-    """
+    """Consulta o CEP em 3 provedores gratuitos (ViaCEP -> BrasilAPI -> OpenCEP)."""
     dig = apenas_digitos(cep_texto)
     if len(dig) != 8:
         return None
 
-    headers = {"User-Agent": "Mozilla/5.0 (SistemaRegularize/2.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (SistemaRegularize/4.0)"}
 
-    # 1. Tentativa: ViaCEP (mais completo para logradouros dos Correios)
     try:
         req = urllib.request.Request(f"https://viacep.com.br/ws/{dig}/json/", headers=headers)
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -174,7 +192,6 @@ def buscar_cep_online(cep_texto):
     except Exception:
         pass
 
-    # 2. Tentativa (fallback): BrasilAPI v2
     try:
         req = urllib.request.Request(f"https://brasilapi.com.br/api/cep/v2/{dig}", headers=headers)
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -190,7 +207,6 @@ def buscar_cep_online(cep_texto):
     except Exception:
         pass
 
-    # 3. Tentativa (fallback): OpenCEP
     try:
         req = urllib.request.Request(f"https://opencep.com/v1/{dig}.json", headers=headers)
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -211,7 +227,7 @@ def buscar_cep_online(cep_texto):
 
 @st.cache_data(ttl=60)
 def carregar_listas_auxiliares():
-    """Carrega contabilidades e listas complementares do PostgreSQL combinadas com o catálogo atualizado."""
+    """Carrega contabilidades e listas do PostgreSQL combinadas com o catálogo atualizado."""
     with engine.connect() as conn:
         df_serv = pd.read_sql(
             text("SELECT linha_credito, tipo_servico, descricao_servico FROM aux_servicos ORDER BY tipo_servico"),
@@ -230,19 +246,16 @@ def carregar_listas_auxiliares():
     for cat, grupo in df_listas.groupby("categoria"):
         listas_db[cat] = [normalizar_espacos(v) for v in grupo["valor"].tolist() if str(v).strip()]
 
-    # Mescla catálogo profissional (config.py) com eventuais serviços extras do banco
     catalogo_completo = {k: dict(v) for k, v in CATALOGO_SERVICOS.items()}
     for _, r in df_serv.iterrows():
         s = normalizar_espacos(r["tipo_servico"])
         if s and s not in catalogo_completo:
-            # Verifica se existe equivalente próximo já no catálogo novo
             catalogo_completo[s] = {
                 "linha": normalizar_espacos(r["linha_credito"] or "OUTROS"),
                 "descricao": str(r["descricao_servico"] or ""),
                 "itens": listas_db.get("ITEM", []),
             }
 
-    # Monta listas finais sem duplicidades
     def _unir(padrao, extras):
         vistos = set()
         saida = []
@@ -269,72 +282,73 @@ def carregar_listas_auxiliares():
 
 
 def _propriedade_vazia():
+    """Campos numéricos começam como None (100% em branco na tela e no PDF)."""
     return {
-        "nome": "", "matricula": "", "num_pes": 0, "espacamento": "",
+        "nome": "", "matricula": "", "num_pes": None, "espacamento": "",
         "variedades": "", "idade": "", "prev_2027": "",
         "prod_2026": "", "prod_2025": "", "prod_2024": "",
-        "venda_2026": 0.0, "venda_2025": 0.0, "venda_2024": 0.0,
+        "venda_2026": None, "venda_2025": None, "venda_2024": None,
     }
 
 
 def inicializar_estado_proposta():
-    """Inicializa os campos isolados na sessão do usuário atual."""
+    """Inicializa os campos isolados na sessão do usuário (campos opcionais começam em branco)."""
     primeiro_serv = "PRONAF - CUSTEIO AGRÍCOLA"
     padrao = {
         "proposta_id_edicao": None,
         "local_emissao": EMPRESA["cidade_padrao"],
         "data_proposta": date.today(),
         "parceiro": EMPRESA["nome_fantasia"],
-        "banco_destino": "BANCO DO BRASIL",
+        "banco_destino": "",
         "cliente_cpf": "",
         "cliente_nome": "",
         "cliente_telefone": "",
-        "tipo_cliente": "PROPRIETÁRIO",
+        "tipo_cliente": "",
         "cep": "",
         "rua": "",
         "localidade": "",
         "bairro": "",
-        "cidade": EMPRESA["cidade_padrao"],
+        "cidade": "",
         "uf": EMPRESA["uf_padrao"],
         "aviso_cep": "",
         "contabilidade_nome": "",
         "contabilidade_cnpj": "",
         "imovel_beneficiado_texto": "",
         "filtro_linha_credito": "TODAS AS LINHAS",
-        "tipo_servico": primeiro_serv,
-        "descricao_servico": CATALOGO_SERVICOS[primeiro_serv]["descricao"],
-        "item_financiado": CATALOGO_SERVICOS[primeiro_serv]["itens"][0],
+        "tipo_servico": "",
+        "descricao_servico": "",
+        "item_financiado": "",
         "item_financiado_custom": "",
-        "cultura": "CAFÉ ARÁBICA",
-        "carencia": "Não",
-        "valor_proposto": 0.0,
-        "tipo_envio_docs": "DIGITAL/E-MAIL",
+        "cultura": "",
+        "carencia": "",
+        "valor_proposto": None,
+        "tipo_envio_docs": "",
         "data_envio_docs": "",
         "faixa_honorario_idx": 2,
-        "desconto_extra": 0.0,
-        "acrescimos": 0.0,
+        "desconto_extra": None,
+        "acrescimos": None,
         "forma_pagamento": "Na emissão da minuta",
-        "num_parcelas": 1,
+        "num_parcelas": None,
         "avalista_nome": "",
         "avalista_cpf": "",
         "conjuge_avalista_nome": "",
         "conjuge_avalista_cpf": "",
         "credito_tipo": "",
-        "credito_valor": 0.0,
-        "beneficio_valor": 0.0,
-        "parcela_consorcio": 0.0,
-        "num_parcelas_consorcio": 0,
+        "credito_valor": None,
+        "beneficio_valor": None,
+        "parcela_consorcio": None,
+        "num_parcelas_consorcio": None,
         "parecer_agencia": "",
         "checklist_docs": {},
         "propriedades_lista": [_propriedade_vazia()],
         "semoventes": {
-            "vacas_leite": 0, "litros_dia": 0.0, "preco_litro": 0.0,
-            "boi_corte": 0, "novilhas": 0, "bezerros": 0,
+            "vacas_leite": None, "litros_dia": None, "preco_litro": None,
+            "boi_corte": None, "novilhas": None, "bezerros": None,
         },
         "renda_extra_1_desc": "",
-        "renda_extra_1_val": 0.0,
+        "renda_extra_1_val": None,
         "renda_extra_2_desc": "",
-        "renda_extra_2_val": 0.0,
+        "renda_extra_2_val": None,
         "bens": "",
     }
     for k, v in padrao.items():
@@ -343,7 +357,7 @@ def inicializar_estado_proposta():
 
 
 # ============================================================================
-# 5. CALLBACKS (GARANTEM ATUALIZAÇÃO IMEDIATA DOS CAMPOS NA TELA SEM BUGS)
+# 5. CALLBACKS (ATUALIZAÇÃO IMEDIATA DOS CAMPOS NA TELA)
 # ============================================================================
 def cb_formatar_doc(chave_campo):
     """Formata automaticamente CPF (000.000.000-00) ou CNPJ (00.000.000/0000-00)."""
@@ -352,15 +366,11 @@ def cb_formatar_doc(chave_campo):
 
 
 def cb_buscar_cep():
-    """
-    CORREÇÃO DO ITEM 14:
-    Roda ANTES dos campos serem redesenhados na tela, garantindo que Rua, Bairro,
-    Cidade e UF sejam preenchidos imediatamente nos respectivos inputs!
-    """
+    """Consulta o CEP antes de redesenhar a tela e preenche Rua, Bairro, Cidade e UF."""
     cep_digitado = st.session_state.get("cep", "")
     dig = apenas_digitos(cep_digitado)
     if len(dig) != 8:
-        st.session_state["aviso_cep"] = "erro:Digite um CEP válido com 8 números (ex.: 31920-350)."
+        st.session_state["aviso_cep"] = "erro:Digite um CEP válido com 8 números."
         return
 
     st.session_state["cep"] = fmt_cep(dig)
@@ -391,19 +401,22 @@ def cb_limpar_formulario():
 
 
 def cb_ao_trocar_servico(catalogo):
-    """Atualiza automaticamente a Descrição do Serviço e sugere o 1º item daquela linha."""
+    """Atualiza automaticamente a Descrição do Serviço e limpa/ajusta o item daquela linha."""
     serv = st.session_state.get("tipo_servico", "")
     info = catalogo.get(serv)
     if info:
         st.session_state["descricao_servico"] = info.get("descricao", "")
         itens_linha = info.get("itens", [])
-        if itens_linha and st.session_state.get("item_financiado") not in itens_linha:
-            st.session_state["item_financiado"] = itens_linha[0]
+        if st.session_state.get("item_financiado") not in itens_linha:
+            st.session_state["item_financiado"] = ""
+    else:
+        st.session_state["descricao_servico"] = ""
+        st.session_state["item_financiado"] = ""
 
 
 def cb_aplicar_imovel_salvo():
-    esc = st.session_state.get("seletor_imovel_salvo", "(Manter digitado)")
-    if esc and esc != "(Manter digitado)":
+    esc = st.session_state.get("seletor_imovel_salvo", "")
+    if esc:
         st.session_state["imovel_beneficiado_texto"] = esc
 
 
@@ -426,7 +439,7 @@ def cb_carregar_cliente(cpf_cnpj):
         props = conn.execute(
             text("""
                 SELECT nome_propriedade, COALESCE(matricula, '') AS matricula,
-                       COALESCE(num_pes_cafe, 0) AS num_pes,
+                       num_pes_cafe AS num_pes,
                        COALESCE(espacamento, '') AS espacamento,
                        COALESCE(variedades, '') AS variedades,
                        COALESCE(idade_lavoura, '') AS idade
@@ -440,12 +453,12 @@ def cb_carregar_cliente(cpf_cnpj):
     st.session_state["cliente_cpf"] = fmt_doc(cli["cpf_cnpj"])
     st.session_state["cliente_nome"] = cli["nome"] or ""
     st.session_state["cliente_telefone"] = cli["telefone"] or ""
-    st.session_state["tipo_cliente"] = cli["tipo_cliente"] or "PROPRIETÁRIO"
+    st.session_state["tipo_cliente"] = cli["tipo_cliente"] or ""
     st.session_state["cep"] = fmt_cep(cli["cep"] or "")
     st.session_state["rua"] = cli["rua"] or ""
     st.session_state["localidade"] = cli["localidade"] or ""
     st.session_state["bairro"] = cli["bairro"] or ""
-    st.session_state["cidade"] = cli["cidade"] or EMPRESA["cidade_padrao"]
+    st.session_state["cidade"] = cli["cidade"] or ""
     st.session_state["uf"] = cli["uf"] or EMPRESA["uf_padrao"]
     st.session_state["contabilidade_nome"] = cli["cont_nome"] or ""
     st.session_state["contabilidade_cnpj"] = fmt_doc(cli["cont_cnpj"] or "")
@@ -457,7 +470,7 @@ def cb_carregar_cliente(cpf_cnpj):
             item_p.update({
                 "nome": p["nome_propriedade"],
                 "matricula": p["matricula"],
-                "num_pes": int(p["num_pes"] or 0),
+                "num_pes": num_int_ou_none(p["num_pes"]),
                 "espacamento": p["espacamento"],
                 "variedades": p["variedades"],
                 "idade": p["idade"],
@@ -474,7 +487,7 @@ def cb_carregar_cliente(cpf_cnpj):
 
 
 def cb_carregar_proposta(proposta_id):
-    """Carrega uma proposta salva do histórico para edição ou reimpressão."""
+    """Carrega uma proposta salva do histórico (mantendo zeros não usados como vazios)."""
     with engine.connect() as conn:
         row = conn.execute(
             text("SELECT * FROM propostas WHERE id = :pid"),
@@ -486,51 +499,68 @@ def cb_carregar_proposta(proposta_id):
 
     cb_carregar_cliente(row["cliente_cpf_cnpj"])
     st.session_state["proposta_id_edicao"] = row["id"]
-    st.session_state["data_proposta"] = row["data_proposta"] or date.today()
+    st.session_state["data_proposta"] = row["data_proposta"]
     st.session_state["local_emissao"] = row["local_emissao"] or EMPRESA["cidade_padrao"]
     st.session_state["parceiro"] = row["parceiro"] or EMPRESA["nome_fantasia"]
-    st.session_state["banco_destino"] = row["banco_destino"] or "BANCO DO BRASIL"
+    st.session_state["banco_destino"] = row["banco_destino"] or ""
     st.session_state["imovel_beneficiado_texto"] = row["imovel_beneficiado_texto"] or ""
     st.session_state["filtro_linha_credito"] = "TODAS AS LINHAS"
-    st.session_state["tipo_servico"] = row["tipo_servico"] or "PRONAF - CUSTEIO AGRÍCOLA"
+    st.session_state["tipo_servico"] = row["tipo_servico"] or ""
     st.session_state["descricao_servico"] = row["descricao_servico"] or ""
     st.session_state["item_financiado"] = row["item_financiado"] or ""
-    st.session_state["cultura"] = row["cultura"] or "CAFÉ ARÁBICA"
-    st.session_state["carencia"] = normalizar_espacos(row["carencia"] or "Não")
-    st.session_state["valor_proposto"] = float(row["valor_proposto"] or 0)
-    st.session_state["tipo_envio_docs"] = row["tipo_envio_docs"] or "DIGITAL/E-MAIL"
+    st.session_state["cultura"] = row["cultura"] or ""
+    st.session_state["carencia"] = normalizar_espacos(row["carencia"] or "")
+    st.session_state["valor_proposto"] = num_float_ou_none(row["valor_proposto"])
+    st.session_state["tipo_envio_docs"] = row["tipo_envio_docs"] or ""
     st.session_state["data_envio_docs"] = row["data_envio_docs"] or ""
     st.session_state["faixa_honorario_idx"] = int(row["faixa_honorario_idx"] or 2)
-    st.session_state["desconto_extra"] = float(row.get("desconto_extra") or 0)
-    st.session_state["acrescimos"] = float(row["acrescimos"] or 0)
-    st.session_state["forma_pagamento"] = row["forma_pagamento"] or "Na emissão da minuta"
-    st.session_state["num_parcelas"] = max(1, int(row["num_parcelas"] or 1))
+    st.session_state["desconto_extra"] = num_float_ou_none(row.get("desconto_extra"))
+    st.session_state["acrescimos"] = num_float_ou_none(row["acrescimos"])
+    st.session_state["forma_pagamento"] = row["forma_pagamento"] or ""
+    st.session_state["num_parcelas"] = num_int_ou_none(row["num_parcelas"])
     st.session_state["avalista_nome"] = row["avalista_nome"] or ""
     st.session_state["avalista_cpf"] = fmt_doc(row["avalista_cpf"] or "")
     st.session_state["conjuge_avalista_nome"] = row["conjuge_avalista_nome"] or ""
     st.session_state["conjuge_avalista_cpf"] = fmt_doc(row["conjuge_avalista_cpf"] or "")
     st.session_state["credito_tipo"] = row["credito_tipo"] or ""
-    st.session_state["credito_valor"] = float(row["credito_valor"] or 0)
-    st.session_state["beneficio_valor"] = float(row["beneficio_valor"] or 0)
-    st.session_state["parcela_consorcio"] = float(row["parcela_consorcio"] or 0)
-    st.session_state["num_parcelas_consorcio"] = int(row["num_parcelas_consorcio"] or 0)
+    st.session_state["credito_valor"] = num_float_ou_none(row["credito_valor"])
+    st.session_state["beneficio_valor"] = num_float_ou_none(row["beneficio_valor"])
+    st.session_state["parcela_consorcio"] = num_float_ou_none(row["parcela_consorcio"])
+    st.session_state["num_parcelas_consorcio"] = num_int_ou_none(row["num_parcelas_consorcio"])
     st.session_state["parecer_agencia"] = row.get("parecer_agencia") or ""
     st.session_state["checklist_docs"] = dict(row["checklist_docs"] or {})
 
     prod = dict(row["dados_producao"] or {})
     if prod.get("propriedades"):
-        st.session_state["propriedades_lista"] = prod["propriedades"]
+        props_limpas = []
+        for p in prod["propriedades"]:
+            pc = _propriedade_vazia()
+            pc.update(p)
+            pc["num_pes"] = num_int_ou_none(pc.get("num_pes"))
+            pc["venda_2026"] = num_float_ou_none(pc.get("venda_2026"))
+            pc["venda_2025"] = num_float_ou_none(pc.get("venda_2025"))
+            pc["venda_2024"] = num_float_ou_none(pc.get("venda_2024"))
+            props_limpas.append(pc)
+        st.session_state["propriedades_lista"] = props_limpas
     if prod.get("semoventes"):
-        st.session_state["semoventes"] = prod["semoventes"]
+        s_raw = prod["semoventes"]
+        st.session_state["semoventes"] = {
+            "vacas_leite": num_int_ou_none(s_raw.get("vacas_leite")),
+            "litros_dia": num_float_ou_none(s_raw.get("litros_dia")),
+            "preco_litro": num_float_ou_none(s_raw.get("preco_litro")),
+            "boi_corte": num_int_ou_none(s_raw.get("boi_corte")),
+            "novilhas": num_int_ou_none(s_raw.get("novilhas")),
+            "bezerros": num_int_ou_none(s_raw.get("bezerros")),
+        }
     st.session_state["renda_extra_1_desc"] = prod.get("renda_extra_1_desc", "")
-    st.session_state["renda_extra_1_val"] = float(prod.get("renda_extra_1_val") or 0)
+    st.session_state["renda_extra_1_val"] = num_float_ou_none(prod.get("renda_extra_1_val"))
     st.session_state["renda_extra_2_desc"] = prod.get("renda_extra_2_desc", "")
-    st.session_state["renda_extra_2_val"] = float(prod.get("renda_extra_2_val") or 0)
+    st.session_state["renda_extra_2_val"] = num_float_ou_none(prod.get("renda_extra_2_val"))
     st.session_state["bens"] = prod.get("bens", "")
 
 
 # ============================================================================
-# 6. CÁLCULOS FINANCEIROS (REGRA DO ITEM 7: VALOR CHEIO 2% + DESCONTO DA FAIXA)
+# 6. CÁLCULOS FINANCEIROS (VALOR CHEIO 2% + DESCONTO DA FAIXA)
 # ============================================================================
 def montar_dicionario_proposta():
     """Calcula Honorários Cheios (2,00%), Desconto da Faixa, Total OS e Renda Bruta."""
@@ -540,18 +570,16 @@ def montar_dicionario_proposta():
     pct_desc_faixa = max(0.0, round(TAXA_HONORARIO_CHEIA - pct_final, 6))
 
     val_prop = float(st.session_state.get("valor_proposto") or 0.0)
-    # Valor Cheio sempre sobre 2,00%
-    valor_cheio_os = round(val_prop * TAXA_HONORARIO_CHEIA, 2)
-    # Desconto concedido automaticamente pela faixa de honorários escolhida
-    desconto_faixa = round(val_prop * pct_desc_faixa, 2)
-    # Desconto extra opcional digitado manualmente
+    tem_valor = val_prop > 0
+    valor_cheio_os = round(val_prop * TAXA_HONORARIO_CHEIA, 2) if tem_valor else 0.0
+    desconto_faixa = round(val_prop * pct_desc_faixa, 2) if tem_valor else 0.0
     desconto_extra = float(st.session_state.get("desconto_extra") or 0.0)
     desconto_total = round(desconto_faixa + desconto_extra, 2)
     acresc = float(st.session_state.get("acrescimos") or 0.0)
 
-    total_os = max(0.0, round(valor_cheio_os - desconto_total + acresc, 2))
-    n_parc = max(1, int(st.session_state.get("num_parcelas") or 1))
-    val_parc = round(total_os / n_parc, 2)
+    total_os = max(0.0, round(valor_cheio_os - desconto_total + acresc, 2)) if (tem_valor or acresc > 0) else 0.0
+    n_parc = num_int_ou_none(st.session_state.get("num_parcelas"))
+    val_parc = round(total_os / n_parc, 2) if (n_parc and total_os > 0) else 0.0
 
     props = st.session_state.get("propriedades_lista") or []
     soma_vendas = sum(float(p.get("venda_2026") or 0) for p in props)
@@ -591,48 +619,48 @@ def montar_dicionario_proposta():
         "item_financiado": item_final,
         "cultura": st.session_state["cultura"],
         "carencia": st.session_state["carencia"],
-        "valor_proposto": val_prop,
+        "valor_proposto": val_prop if tem_valor else None,
         "tipo_envio_docs": st.session_state["tipo_envio_docs"],
         "data_envio_docs": st.session_state["data_envio_docs"],
         "faixa_honorario_idx": idx_faixa,
         "percentual_honorario": pct_final,
         "percentual_desconto_faixa": pct_desc_faixa,
-        "valor_cheio_os": valor_cheio_os,
-        "valor_projeto_tecnico": valor_cheio_os,
-        "desconto_faixa": desconto_faixa,
-        "desconto_extra": desconto_extra,
-        "desconto": desconto_total,
-        "acrescimos": acresc,
-        "valor_total_os": total_os,
+        "valor_cheio_os": valor_cheio_os if tem_valor else None,
+        "valor_projeto_tecnico": valor_cheio_os if tem_valor else None,
+        "desconto_faixa": desconto_faixa if desconto_faixa > 0 else None,
+        "desconto_extra": desconto_extra if desconto_extra > 0 else None,
+        "desconto": desconto_total if desconto_total > 0 else None,
+        "acrescimos": acresc if acresc > 0 else None,
+        "valor_total_os": total_os if (tem_valor or acresc > 0) else None,
         "forma_pagamento": st.session_state["forma_pagamento"],
         "num_parcelas": n_parc,
-        "valor_parcela": val_parc,
+        "valor_parcela": val_parc if val_parc > 0 else None,
         "avalista_nome": st.session_state["avalista_nome"].strip().upper(),
         "avalista_cpf": apenas_digitos(st.session_state["avalista_cpf"]),
         "conjuge_avalista_nome": st.session_state["conjuge_avalista_nome"].strip().upper(),
         "conjuge_avalista_cpf": apenas_digitos(st.session_state["conjuge_avalista_cpf"]),
         "credito_tipo": st.session_state["credito_tipo"],
-        "credito_valor": float(st.session_state.get("credito_valor") or 0),
-        "beneficio_valor": float(st.session_state.get("beneficio_valor") or 0),
-        "parcela_consorcio": float(st.session_state.get("parcela_consorcio") or 0),
-        "num_parcelas_consorcio": int(st.session_state.get("num_parcelas_consorcio") or 0),
+        "credito_valor": num_float_ou_none(st.session_state.get("credito_valor")),
+        "beneficio_valor": num_float_ou_none(st.session_state.get("beneficio_valor")),
+        "parcela_consorcio": num_float_ou_none(st.session_state.get("parcela_consorcio")),
+        "num_parcelas_consorcio": num_int_ou_none(st.session_state.get("num_parcelas_consorcio")),
         "parecer_agencia": st.session_state.get("parecer_agencia", "").strip(),
         "checklist_docs": st.session_state.get("checklist_docs", {}),
         "dados_producao": {
             "propriedades": props,
             "semoventes": st.session_state.get("semoventes", {}),
             "renda_extra_1_desc": st.session_state.get("renda_extra_1_desc", ""),
-            "renda_extra_1_val": float(st.session_state.get("renda_extra_1_val") or 0),
+            "renda_extra_1_val": num_float_ou_none(st.session_state.get("renda_extra_1_val")),
             "renda_extra_2_desc": st.session_state.get("renda_extra_2_desc", ""),
-            "renda_extra_2_val": float(st.session_state.get("renda_extra_2_val") or 0),
+            "renda_extra_2_val": num_float_ou_none(st.session_state.get("renda_extra_2_val")),
             "bens": st.session_state.get("bens", ""),
         },
-        "renda_bruta_anual": renda_bruta,
+        "renda_bruta_anual": renda_bruta if renda_bruta > 0 else None,
     }
 
 
 def salvar_tudo_no_banco():
-    """Salva Cliente, Propriedades e Proposta de forma atômica (seguro para vários usuários ao mesmo tempo)."""
+    """Salva Cliente, Propriedades e Proposta de forma atômica no PostgreSQL."""
     d = montar_dicionario_proposta()
     if len(d["cliente_cpf"]) not in (11, 14):
         st.error("❌ Informe um CPF (11 números) ou CNPJ (14 números) válido antes de salvar.")
@@ -706,7 +734,7 @@ def salvar_tudo_no_banco():
                 """),
                 {
                     "cpf": d["cliente_cpf"], "nome": nome_p, "mat": mat_p,
-                    "pes": int(p.get("num_pes") or 0),
+                    "pes": num_int_ou_none(p.get("num_pes")),
                     "esp": str(p.get("espacamento") or ""),
                     "var": str(p.get("variedades") or ""),
                     "idade": str(p.get("idade") or ""),
@@ -716,7 +744,7 @@ def salvar_tudo_no_banco():
                 prop_benef_id = res_p[0]
 
         params_prop = {
-            "data_proposta": d["data_proposta"],
+            "data_proposta": d["data_proposta"] or date.today(),
             "local_emissao": d["local_emissao"],
             "parceiro": d["parceiro"],
             "banco_destino": d["banco_destino"],
@@ -728,34 +756,34 @@ def salvar_tudo_no_banco():
             "item_financiado": d["item_financiado"],
             "cultura": d["cultura"],
             "carencia": d["carencia"],
-            "valor_proposto": d["valor_proposto"],
+            "valor_proposto": float(d["valor_proposto"] or 0),
             "tipo_envio_docs": d["tipo_envio_docs"],
             "data_envio_docs": d["data_envio_docs"],
             "faixa_honorario_idx": d["faixa_honorario_idx"],
             "percentual_honorario": d["percentual_honorario"],
-            "valor_cheio_os": d["valor_cheio_os"],
-            "valor_projeto_tecnico": d["valor_cheio_os"],
-            "desconto_faixa": d["desconto_faixa"],
-            "desconto_extra": d["desconto_extra"],
-            "desconto": d["desconto"],
-            "acrescimos": d["acrescimos"],
-            "valor_total_os": d["valor_total_os"],
+            "valor_cheio_os": float(d["valor_cheio_os"] or 0),
+            "valor_projeto_tecnico": float(d["valor_cheio_os"] or 0),
+            "desconto_faixa": float(d["desconto_faixa"] or 0),
+            "desconto_extra": float(d["desconto_extra"] or 0),
+            "desconto": float(d["desconto"] or 0),
+            "acrescimos": float(d["acrescimos"] or 0),
+            "valor_total_os": float(d["valor_total_os"] or 0),
             "forma_pagamento": d["forma_pagamento"],
-            "num_parcelas": d["num_parcelas"],
-            "valor_parcela": d["valor_parcela"],
+            "num_parcelas": int(d["num_parcelas"] or 0),
+            "valor_parcela": float(d["valor_parcela"] or 0),
             "avalista_nome": d["avalista_nome"],
             "avalista_cpf": d["avalista_cpf"],
             "conjuge_avalista_nome": d["conjuge_avalista_nome"],
             "conjuge_avalista_cpf": d["conjuge_avalista_cpf"],
             "credito_tipo": d["credito_tipo"],
-            "credito_valor": d["credito_valor"],
-            "beneficio_valor": d["beneficio_valor"],
-            "parcela_consorcio": d["parcela_consorcio"],
-            "num_parcelas_consorcio": d["num_parcelas_consorcio"],
+            "credito_valor": float(d["credito_valor"] or 0),
+            "beneficio_valor": float(d["beneficio_valor"] or 0),
+            "parcela_consorcio": float(d["parcela_consorcio"] or 0),
+            "num_parcelas_consorcio": int(d["num_parcelas_consorcio"] or 0),
             "parecer_agencia": d["parecer_agencia"],
             "checklist_docs": json.dumps(d["checklist_docs"], ensure_ascii=False),
             "dados_producao": json.dumps(d["dados_producao"], ensure_ascii=False),
-            "renda_bruta_anual": d["renda_bruta_anual"],
+            "renda_bruta_anual": float(d["renda_bruta_anual"] or 0),
             "criado_por": usuario_atual,
         }
 
@@ -883,7 +911,7 @@ with aba1:
     st.subheader("🔍 Pesquisar Cliente Cadastrado")
     termo_cli = st.text_input(
         "Digite parte do Nome ou CPF/CNPJ para carregar dados e imóveis salvos:",
-        placeholder="Ex.: Poliana ou 123.456.789-99",
+        placeholder="",
     )
     if termo_cli.strip():
         with engine.connect() as conn:
@@ -902,7 +930,7 @@ with aba1:
             )
         if not df_encontrados.empty:
             opcoes_cli = {
-                f"{r['nome']} — {fmt_doc(r['cpf_cnpj'])} ({r['cidade']})": r["cpf_cnpj"]
+                f"{r['nome']} | {fmt_doc(r['cpf_cnpj'])} {('(' + r['cidade'] + ')') if r['cidade'] else ''}".strip(): r["cpf_cnpj"]
                 for _, r in df_encontrados.iterrows()
             }
             escolhido = st.selectbox("Selecione o cliente encontrado:", list(opcoes_cli.keys()))
@@ -921,9 +949,9 @@ with aba1:
     c1.text_input("Local de Emissão", key="local_emissao")
     c2.date_input("Data da Proposta", key="data_proposta", format="DD/MM/YYYY")
     c3.text_input("Parceiro / Escritório", key="parceiro")
-    bancos_lista = listas_cat["BANCO"]
+    bancos_lista = [""] + listas_cat["BANCO"]
     if st.session_state["banco_destino"] not in bancos_lista:
-        bancos_lista = [st.session_state["banco_destino"]] + bancos_lista
+        bancos_lista.append(st.session_state["banco_destino"])
     c4.selectbox("Banco Destino", bancos_lista, key="banco_destino")
 
     p1, p2, p3, p4 = st.columns([2.2, 1.4, 1.2, 1.2])
@@ -931,27 +959,25 @@ with aba1:
     p2.text_input(
         "CPF ou CNPJ *",
         key="cliente_cpf",
-        placeholder="000.000.000-00 ou 00.000.000/0000-00",
         help="Digite apenas números e aperte Enter/Tab: os pontos, traço e barra entram automaticamente.",
         on_change=cb_formatar_doc,
         args=("cliente_cpf",),
     )
-    p3.text_input("Telefone / WhatsApp", key="cliente_telefone", placeholder="(32) 99999-9999")
-    tipos_cli = listas_cat["TIPO_CLIENTE"]
+    p3.text_input("Telefone / WhatsApp", key="cliente_telefone")
+    tipos_cli = [""] + listas_cat["TIPO_CLIENTE"]
     if st.session_state["tipo_cliente"] not in tipos_cli:
-        tipos_cli = [st.session_state["tipo_cliente"]] + tipos_cli
+        tipos_cli.append(st.session_state["tipo_cliente"])
     p4.selectbox("Tipo de Cliente", tipos_cli, key="tipo_cliente")
 
-    # Endereço com busca automática de CEP (CORRIGIDA NO ITEM 14!)
+    # Endereço com busca automática de CEP
     e1, e_btn, e2, e3 = st.columns([1.2, 0.9, 2.5, 1.4])
-    e1.text_input("CEP", key="cep", placeholder="00000-000")
+    e1.text_input("CEP", key="cep")
     e_btn.write("")
     e_btn.write("")
     e_btn.button("🔎 Buscar CEP", on_click=cb_buscar_cep, use_container_width=True)
     e2.text_input("Rua / Logradouro", key="rua")
     e3.text_input("Localidade / Comunidade", key="localidade")
 
-    # Feedback claro sobre a busca do CEP
     aviso_cep = st.session_state.get("aviso_cep", "")
     if aviso_cep.startswith("ok:"):
         st.success(aviso_cep[3:])
@@ -972,22 +998,16 @@ with aba1:
         for p in props_atuais if p.get("nome")
     ]
     im1, im2 = st.columns([2, 1.5])
-    im1.text_input(
-        "Imóvel Beneficiado (Nome + Matrícula)",
-        key="imovel_beneficiado_texto",
-        help="Você pode digitar livremente ou selecionar ao lado um imóvel já cadastrado na Aba 2.",
-    )
+    im1.text_input("Imóvel Beneficiado (Nome + Matrícula)", key="imovel_beneficiado_texto")
     if opcoes_imov:
         im2.selectbox(
             "Ou selecionar imóvel salvo do cliente:",
-            ["(Manter digitado)"] + opcoes_imov,
+            [""] + opcoes_imov,
             key="seletor_imovel_salvo",
             on_change=cb_aplicar_imovel_salvo,
         )
 
-    # ========================================================================
-    # OPERAÇÃO DE CRÉDITO: LINHA -> SERVIÇO -> ITENS FINANCIÁVEIS -> CULTURAS MG
-    # ========================================================================
+    # OPERAÇÃO DE CRÉDITO
     st.markdown("#### 💰 Operação de Crédito, Linha, Itens Financiáveis e Culturas (MG)")
 
     linhas_disponiveis = ["TODAS AS LINHAS"] + sorted({v["linha"] for v in catalogo_servicos.values()})
@@ -995,12 +1015,12 @@ with aba1:
     linha_filtro = fl1.selectbox("Filtrar por Linha de Crédito", linhas_disponiveis, key="filtro_linha_credito")
 
     if linha_filtro == "TODAS AS LINHAS":
-        servicos_filtrados = list(catalogo_servicos.keys())
+        servicos_filtrados = [""] + list(catalogo_servicos.keys())
     else:
-        servicos_filtrados = [k for k, v in catalogo_servicos.items() if v["linha"] == linha_filtro]
+        servicos_filtrados = [""] + [k for k, v in catalogo_servicos.items() if v["linha"] == linha_filtro]
 
-    if st.session_state["tipo_servico"] not in servicos_filtrados and servicos_filtrados:
-        st.session_state["tipo_servico"] = servicos_filtrados[0]
+    if st.session_state["tipo_servico"] not in servicos_filtrados:
+        st.session_state["tipo_servico"] = ""
         cb_ao_trocar_servico(catalogo_servicos)
 
     fl2.selectbox(
@@ -1012,35 +1032,24 @@ with aba1:
     )
 
     op1, op2, op3 = st.columns(3)
-    # Itens financiáveis filtrados pela linha/serviço escolhido!
     info_serv_atual = catalogo_servicos.get(st.session_state["tipo_servico"], {})
-    itens_da_linha = list(info_serv_atual.get("itens", [])) or listas_cat["TODOS_ITENS"]
-    opcoes_item = itens_da_linha + ["OUTRO ITEM (DIGITAR MANUALMENTE)"]
+    itens_da_linha = list(info_serv_atual.get("itens", [])) if info_serv_atual else listas_cat["TODOS_ITENS"]
+    opcoes_item = [""] + itens_da_linha + ["OUTRO ITEM (DIGITAR MANUALMENTE)"]
     if st.session_state["item_financiado"] not in opcoes_item:
-        if st.session_state["item_financiado"]:
-            opcoes_item = [st.session_state["item_financiado"]] + opcoes_item
-        else:
-            st.session_state["item_financiado"] = opcoes_item[0]
+        opcoes_item.insert(1, st.session_state["item_financiado"])
 
-    op1.selectbox(
-        "Item Financiável desta Linha",
-        opcoes_item,
-        key="item_financiado",
-        help="Lista filtrada conforme os itens aceitos pela linha de crédito escolhida acima.",
-    )
+    op1.selectbox("Item Financiável desta Linha", opcoes_item, key="item_financiado")
     if st.session_state["item_financiado"] == "OUTRO ITEM (DIGITAR MANUALMENTE)":
         op1.text_input("Digite o item financiado:", key="item_financiado_custom")
 
-    # Culturas principais de Minas Gerais
-    lista_cult = listas_cat["CULTURA"]
+    lista_cult = [""] + listas_cat["CULTURA"]
     if st.session_state["cultura"] not in lista_cult:
-        lista_cult = [st.session_state["cultura"]] + lista_cult
+        lista_cult.append(st.session_state["cultura"])
     op2.selectbox("Cultura / Atividade Principal (Minas Gerais)", lista_cult, key="cultura")
 
-    # Carência (incluindo SIM (1 ano))
-    lista_car = listas_cat["CARENCIA"]
+    lista_car = [""] + listas_cat["CARENCIA"]
     if st.session_state["carencia"] not in lista_car:
-        lista_car = [st.session_state["carencia"]] + lista_car
+        lista_car.append(st.session_state["carencia"])
     op3.selectbox("Carência", lista_car, key="carencia")
 
     op4, op5 = st.columns(2)
@@ -1050,6 +1059,7 @@ with aba1:
         step=1000.0,
         format="%.2f",
         key="valor_proposto",
+        placeholder="",
     )
 
     nomes_cont = [""] + df_contabilidades["nome"].tolist()
@@ -1073,11 +1083,11 @@ with aba1:
         for doc_nome in DOCS_IMOVEL:
             chave = f"imov_{doc_nome}"
             chk[chave] = st.checkbox(doc_nome, value=bool(chk.get(chave, False)), key=f"ui_{chave}")
-        lista_envio = listas_cat["TIPO_ENVIO"]
+        lista_envio = [""] + listas_cat["TIPO_ENVIO"]
         if st.session_state["tipo_envio_docs"] not in lista_envio:
-            lista_envio = [st.session_state["tipo_envio_docs"]] + lista_envio
+            lista_envio.append(st.session_state["tipo_envio_docs"])
         st.selectbox("Tipo de Envio dos Documentos", lista_envio, key="tipo_envio_docs")
-        st.text_input("Data de Envio dos Docs", key="data_envio_docs", placeholder="DD/MM/AAAA")
+        st.text_input("Data de Envio dos Docs", key="data_envio_docs", placeholder="")
     with ck3:
         st.caption("**COOBRIGADOS**")
         for doc_nome in DOCS_COOBRIGADOS:
@@ -1085,9 +1095,7 @@ with aba1:
             chk[chave] = st.checkbox(doc_nome, value=bool(chk.get(chave, False)), key=f"ui_{chave}")
     st.session_state["checklist_docs"] = chk
 
-    # ========================================================================
-    # ITEM 9: MARGEM DE CRÉDITO PESSOAL E AVALISTAS TOTALMENTE SEPARADOS!
-    # ========================================================================
+    # MARGEM CRÉDITO PESSOAL E AVALISTAS SEPARADOS (CAMPOS VAZIOS EM BRANCO!)
     st.divider()
     col_margem, col_aval = st.columns(2)
 
@@ -1098,12 +1106,12 @@ with aba1:
         if st.session_state["credito_tipo"] not in lista_tc_cred:
             lista_tc_cred.append(st.session_state["credito_tipo"])
         m1.selectbox("Tipo de Crédito Pessoal", lista_tc_cred, key="credito_tipo")
-        m2.number_input("Valor do Crédito (R$)", min_value=0.0, format="%.2f", key="credito_valor")
+        m2.number_input("Valor do Crédito (R$)", min_value=0.0, step=100.0, format="%.2f", key="credito_valor", placeholder="")
 
         m3, m4 = st.columns(2)
-        m3.number_input("Valor do Benefício (R$)", min_value=0.0, format="%.2f", key="beneficio_valor")
-        m4.number_input("Parcela Consórcio (R$)", min_value=0.0, format="%.2f", key="parcela_consorcio")
-        st.number_input("Nº de Parcelas do Consórcio", min_value=0, step=1, key="num_parcelas_consorcio")
+        m3.number_input("Valor do Benefício (R$)", min_value=0.0, step=100.0, format="%.2f", key="beneficio_valor", placeholder="")
+        m4.number_input("Parcela Consórcio (R$)", min_value=0.0, step=100.0, format="%.2f", key="parcela_consorcio", placeholder="")
+        st.number_input("Nº de Parcelas do Consórcio", min_value=0, step=1, key="num_parcelas_consorcio", placeholder="")
 
     with col_aval:
         st.markdown("#### 🤝 Avalistas (Avalista e Cônjuge)")
@@ -1111,7 +1119,6 @@ with aba1:
         st.text_input(
             "CPF/CNPJ do Avalista",
             key="avalista_cpf",
-            placeholder="000.000.000-00",
             on_change=cb_formatar_doc,
             args=("avalista_cpf",),
         )
@@ -1119,29 +1126,26 @@ with aba1:
         st.text_input(
             "CPF do Cônjuge do Avalista",
             key="conjuge_avalista_cpf",
-            placeholder="000.000.000-00",
             on_change=cb_formatar_doc,
             args=("conjuge_avalista_cpf",),
         )
 
-    # ========================================================================
-    # ITEM 10: PARECER DA AGÊNCIA BANCÁRIA
-    # ========================================================================
+    # PARECER DA AGÊNCIA BANCÁRIA
     st.divider()
     st.markdown("#### 🏦 Parecer da Agência Bancária")
     st.text_area(
-        "Observações / Parecer da Agência (opcional — se deixar em branco, o PDF imprime o quadro livre para preenchimento à mão na agência):",
+        "Observações / Parecer da Agência (opcional — deixe em branco para preencher à mão no documento impresso):",
         key="parecer_agencia",
         height=75,
     )
 
 
 # ----------------------------------------------------------------------------
-# ABA 2: ANÁLISE PRODUTIVA (PRODUÇÃO)
+# ABA 2: ANÁLISE PRODUTIVA (CAMPOS VAZIOS 100% EM BRANCO)
 # ----------------------------------------------------------------------------
 with aba2:
     st.subheader("🌱 Análise Produtiva e Propriedades do Produtor")
-    st.caption("A primeira propriedade representa o Imóvel Beneficiado. As demais entram como propriedades adicionais / garantias.")
+    st.caption("A primeira propriedade representa o Imóvel Beneficiado. Deixe em branco os campos que não se aplicam.")
 
     props = st.session_state["propriedades_lista"]
     col_add, col_rem = st.columns([1, 1])
@@ -1154,12 +1158,14 @@ with aba2:
 
     for idx, p in enumerate(props):
         titulo_box = "🏡 Propriedade 1 (Beneficiada)" if idx == 0 else f"🏡 Propriedade {idx + 1}"
-        with st.expander(f"{titulo_box} — {p.get('nome') or 'Sem nome'}", expanded=(idx == 0)):
-            r1c1, r1c2, r1c3, r1c4 = st.columns([2, 1, 1, 1])
-            p["nome"] = r1c1.text_input("Nome da Propriedade", value=p.get("nome", ""), key=f"p_nome_{idx}")
-            p["matricula"] = r1c2.text_input("Matrícula", value=p.get("matricula", ""), key=f"p_mat_{idx}")
-            p["num_pes"] = r1c3.number_input("Nº Pés de Café", min_value=0, step=100, value=int(p.get("num_pes") or 0), key=f"p_pes_{idx}")
-            p["espacamento"] = r1c4.text_input("Espaçamento", value=p.get("espacamento", ""), key=f"p_esp_{idx}")
+        nome_exib = f" — {p.get('nome')}" if p.get("nome") else ""
+        with st.expander(f"{titulo_box}{nome_exib}", expanded=(idx == 0)):
+            # Linha inteira dedicada ao Nome da Propriedade
+            p["nome"] = st.text_input("Nome da Propriedade", value=p.get("nome", ""), key=f"p_nome_{idx}")
+            r1c1, r1c2, r1c3 = st.columns(3)
+            p["matricula"] = r1c1.text_input("Matrícula", value=p.get("matricula", ""), key=f"p_mat_{idx}")
+            p["num_pes"] = r1c2.number_input("Nº Pés de Café", min_value=0, step=100, value=num_int_ou_none(p.get("num_pes")), key=f"p_pes_{idx}", placeholder="")
+            p["espacamento"] = r1c3.text_input("Espaçamento", value=p.get("espacamento", ""), key=f"p_esp_{idx}")
 
             r2c1, r2c2, r2c3 = st.columns(3)
             p["variedades"] = r2c1.text_input("Variedades", value=p.get("variedades", ""), key=f"p_var_{idx}")
@@ -1172,42 +1178,42 @@ with aba2:
             p["prod_2024"] = r3c3.text_input("Produção 2024", value=p.get("prod_2024", ""), key=f"p_p24_{idx}")
 
             r4c1, r4c2, r4c3 = st.columns(3)
-            p["venda_2026"] = r4c1.number_input("Valor de Venda 2026 (R$)", min_value=0.0, step=500.0, value=float(p.get("venda_2026") or 0), key=f"p_v26_{idx}", format="%.2f")
-            p["venda_2025"] = r4c2.number_input("Valor de Venda 2025 (R$)", min_value=0.0, step=500.0, value=float(p.get("venda_2025") or 0), key=f"p_v25_{idx}", format="%.2f")
-            p["venda_2024"] = r4c3.number_input("Valor de Venda 2024 (R$)", min_value=0.0, step=500.0, value=float(p.get("venda_2024") or 0), key=f"p_v24_{idx}", format="%.2f")
+            p["venda_2026"] = r4c1.number_input("Valor de Venda 2026 (R$)", min_value=0.0, step=500.0, value=num_float_ou_none(p.get("venda_2026")), key=f"p_v26_{idx}", format="%.2f", placeholder="")
+            p["venda_2025"] = r4c2.number_input("Valor de Venda 2025 (R$)", min_value=0.0, step=500.0, value=num_float_ou_none(p.get("venda_2025")), key=f"p_v25_{idx}", format="%.2f", placeholder="")
+            p["venda_2024"] = r4c3.number_input("Valor de Venda 2024 (R$)", min_value=0.0, step=500.0, value=num_float_ou_none(p.get("venda_2024")), key=f"p_v24_{idx}", format="%.2f", placeholder="")
 
     st.divider()
     st.markdown("#### 🐄 Semoventes, Renda Extra e Bens")
     sem = st.session_state["semoventes"]
     s1, s2, s3 = st.columns(3)
-    sem["vacas_leite"] = s1.number_input("Vacas de Leite (qtd)", min_value=0, step=1, value=int(sem.get("vacas_leite") or 0))
-    sem["litros_dia"] = s2.number_input("Litros por Dia", min_value=0.0, step=5.0, value=float(sem.get("litros_dia") or 0))
-    sem["preco_litro"] = s3.number_input("Preço por Litro (R$)", min_value=0.0, step=0.10, value=float(sem.get("preco_litro") or 0), format="%.2f")
+    sem["vacas_leite"] = s1.number_input("Vacas de Leite (qtd)", min_value=0, step=1, value=num_int_ou_none(sem.get("vacas_leite")), placeholder="")
+    sem["litros_dia"] = s2.number_input("Litros por Dia", min_value=0.0, step=5.0, value=num_float_ou_none(sem.get("litros_dia")), placeholder="")
+    sem["preco_litro"] = s3.number_input("Preço por Litro (R$)", min_value=0.0, step=0.10, value=num_float_ou_none(sem.get("preco_litro")), format="%.2f", placeholder="")
 
     s4, s5, s6 = st.columns(3)
-    sem["boi_corte"] = s4.number_input("Boi de Corte (qtd)", min_value=0, step=1, value=int(sem.get("boi_corte") or 0))
-    sem["novilhas"] = s5.number_input("Novilhas (qtd)", min_value=0, step=1, value=int(sem.get("novilhas") or 0))
-    sem["bezerros"] = s6.number_input("Bezerros (qtd)", min_value=0, step=1, value=int(sem.get("bezerros") or 0))
+    sem["boi_corte"] = s4.number_input("Boi de Corte (qtd)", min_value=0, step=1, value=num_int_ou_none(sem.get("boi_corte")), placeholder="")
+    sem["novilhas"] = s5.number_input("Novilhas (qtd)", min_value=0, step=1, value=num_int_ou_none(sem.get("novilhas")), placeholder="")
+    sem["bezerros"] = s6.number_input("Bezerros (qtd)", min_value=0, step=1, value=num_int_ou_none(sem.get("bezerros")), placeholder="")
 
     re1, re2, re3, re4 = st.columns([2, 1, 2, 1])
     re1.text_input("Renda Extra 1 (Descrição)", key="renda_extra_1_desc")
-    re2.number_input("Valor Renda 1 (R$)", min_value=0.0, step=500.0, format="%.2f", key="renda_extra_1_val")
+    re2.number_input("Valor Renda 1 (R$)", min_value=0.0, step=500.0, format="%.2f", key="renda_extra_1_val", placeholder="")
     re3.text_input("Renda Extra 2 (Descrição)", key="renda_extra_2_desc")
-    re4.number_input("Valor Renda 2 (R$)", min_value=0.0, step=500.0, format="%.2f", key="renda_extra_2_val")
+    re4.number_input("Valor Renda 2 (R$)", min_value=0.0, step=500.0, format="%.2f", key="renda_extra_2_val", placeholder="")
 
     st.text_area("Relação de Bens (máquinas, veículos, benfeitorias)", key="bens", height=80)
 
     resumo_prod = montar_dicionario_proposta()
-    st.metric("💵 Renda Bruta Anual Calculada", fmt_moeda(resumo_prod["renda_bruta_anual"]))
+    st.metric("💵 Renda Bruta Anual Calculada", fmt_moeda(resumo_prod["renda_bruta_anual"]) or " ")
 
 
 # ----------------------------------------------------------------------------
-# ABA 3: ORDEM DE SERVIÇO (ITEM 7: VALOR CHEIO 2% + DESCONTO DA FAIXA) & LGPD
+# ABA 3: ORDEM DE SERVIÇO & LGPD (SEM GOV.BR + COOPERATIVAS DE CRÉDITO)
 # ----------------------------------------------------------------------------
 with aba3:
     st.subheader("🧾 Ordem de Serviço — Valor Cheio (2,00%) e Desconto Concedido")
     st.caption(
-        "Na impressão da Ordem de Serviço, o sistema sempre exibe o Valor Cheio (2,00%) nos honorários e destaca "
+        "Na impressão da Ordem de Serviço, o sistema exibe o Valor Cheio (2,00%) nos honorários e destaca "
         "no campo Desconto a redução concedida pela faixa escolhida abaixo."
     )
 
@@ -1225,29 +1231,37 @@ with aba3:
         format_func=lambda k: FAIXAS_HONORARIOS[k]["rotulo"],
         key="faixa_honorario_idx",
     )
-    os2.number_input("Desconto Extra Manual (R$)", min_value=0.0, step=100.0, format="%.2f", key="desconto_extra")
-    os3.number_input("Acréscimos (R$)", min_value=0.0, step=100.0, format="%.2f", key="acrescimos")
-    os4.number_input("Nº de Parcelas", min_value=1, step=1, key="num_parcelas")
+    os2.number_input("Desconto Extra Manual (R$)", min_value=0.0, step=100.0, format="%.2f", key="desconto_extra", placeholder="")
+    os3.number_input("Acréscimos (R$)", min_value=0.0, step=100.0, format="%.2f", key="acrescimos", placeholder="")
+    os4.number_input("Nº de Parcelas", min_value=1, step=1, key="num_parcelas", placeholder="")
 
     st.text_input("Forma de Pagamento", key="forma_pagamento")
 
     d_calc = montar_dicionario_proposta()
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Valor Proposto", fmt_moeda(d_calc["valor_proposto"]))
-    k2.metric("Valor Cheio (2,00%)", fmt_moeda(d_calc["valor_cheio_os"]))
-    k3.metric(
-        f"Desconto Concedido ({d_calc['percentual_desconto_faixa']*100:.2f}%)",
-        f"- {fmt_moeda(d_calc['desconto'])}" if d_calc["desconto"] > 0 else fmt_moeda(0),
-    )
-    k4.metric("TOTAL DA OS", fmt_moeda(d_calc["valor_total_os"]))
-    k5.metric(f"{d_calc['num_parcelas']}x Parcela(s)", fmt_moeda(d_calc["valor_parcela"]))
+    k1.metric("Valor Proposto", fmt_moeda(d_calc["valor_proposto"]) or " ")
+    k2.metric("Valor Cheio (2,00%)", fmt_moeda(d_calc["valor_cheio_os"]) or " ")
+    desc_val_txt = f"- {fmt_moeda(d_calc['desconto'])}" if d_calc["desconto"] else " "
+    k3.metric(f"Desconto Concedido ({d_calc['percentual_desconto_faixa']*100:.2f}%)", desc_val_txt)
+    if d_calc["valor_proposto"] and d_calc["percentual_honorario"] == 0 and not d_calc["valor_total_os"]:
+        tot_txt = "ISENTO"
+    else:
+        tot_txt = fmt_moeda(d_calc["valor_total_os"]) or " "
+    k4.metric("TOTAL DA OS", tot_txt)
+    rot_parc = f"{d_calc['num_parcelas']}x Parcela(s)" if d_calc["num_parcelas"] else "Parcelamento"
+    k5.metric(rot_parc, fmt_moeda(d_calc["valor_parcela"]) or " ")
 
     st.divider()
     st.subheader("🔒 Conferência do Termo LGPD (Proteção de Dados)")
+    banco_lgpd = d_calc["banco_destino"]
+    inst_lgpd_txt = f"{banco_lgpd} (Instituições financeiras e cooperativas de crédito)" if banco_lgpd else "Instituições financeiras e cooperativas de crédito"
+    cnpj_cont_txt = fmt_doc(d_calc["contabilidade_cnpj"])
+    cont_linha = f"{d_calc['contabilidade_nome']} (CNPJ: {cnpj_cont_txt})" if (d_calc["contabilidade_nome"] and cnpj_cont_txt) else d_calc["contabilidade_nome"]
+
     st.info(
-        f"**Titular:** {d_calc['cliente_nome'] or '(preencher na Aba 1)'} | **CPF/CNPJ:** {fmt_doc(d_calc['cliente_cpf'])}\n\n"
-        f"**Contabilidade:** {d_calc['contabilidade_nome'] or 'Não informada'} "
-        f"(CNPJ: {fmt_doc(d_calc['contabilidade_cnpj']) or '—'}) | **Banco:** {d_calc['banco_destino']}"
+        f"**Titular:** {d_calc['cliente_nome']}  |  **CPF/CNPJ:** {fmt_doc(d_calc['cliente_cpf'])}\n\n"
+        f"**Contabilidade:** {cont_linha}\n\n"
+        f"**Instituição Financeira / Abrangência:** {inst_lgpd_txt}"
     )
 
     if st.button("💾 Salvar Proposta e Atualizar Cadastro no Banco", type="primary", use_container_width=True):
@@ -1257,12 +1271,13 @@ with aba3:
 
 
 # ----------------------------------------------------------------------------
-# ABA 4: IMPRESSÃO / PDFs (100% PRETO E BRANCO, 1 PÁGINA/FOLHA, MARCA D'ÁGUA)
+# ABA 4: IMPRESSÃO / PDFs (P&B, MARGENS CONFORTÁVEIS, 1 FOLHA A4, MARCA D'ÁGUA)
 # ----------------------------------------------------------------------------
 with aba4:
     st.subheader("🖨️ Impressão de Pacotes Bancários e Documentos Avulsos")
     st.info(
-        "🖨️ **Padrão de Impressão Ativado:** Preto e Branco • Margens estreitas (folha A4 cheia, 1 página por documento) • "
+        "🖨️ **Padrão de Impressão Ativado:** Preto e Branco • Margens confortáveis (1,4 cm × 1,3 cm) • "
+        "Distribuição equilibrada em 1 folha A4 por documento • Campos vazios em branco • "
         "Marca d'água oficial da Regularize em todas as folhas."
     )
 
@@ -1322,7 +1337,7 @@ with aba4:
 with aba5:
     st.subheader("🗂️ Histórico de Propostas Salvas")
     f1, f2, f3 = st.columns([2, 1.5, 1])
-    busca_hist = f1.text_input("Filtrar por Nome ou CPF/CNPJ:", placeholder="Digite nome ou números do CPF/CNPJ")
+    busca_hist = f1.text_input("Filtrar por Nome ou CPF/CNPJ:", placeholder="")
     banco_hist = f2.selectbox("Filtrar por Banco:", ["TODOS"] + listas_cat["BANCO"])
     limite_hist = f3.number_input("Máximo de registros", min_value=20, max_value=2000, value=200, step=50)
 
@@ -1355,15 +1370,15 @@ with aba5:
         df_exibir = df_hist.copy()
         df_exibir["cpf_cnpj"] = df_exibir["cpf_cnpj"].apply(fmt_doc)
         df_exibir["data_proposta"] = pd.to_datetime(df_exibir["data_proposta"]).dt.strftime("%d/%m/%Y")
-        df_exibir["valor_proposto_fmt"] = df_exibir["valor_proposto"].apply(fmt_moeda)
-        df_exibir["valor_total_os_fmt"] = df_exibir["valor_total_os"].apply(fmt_moeda)
+        df_exibir["valor_proposto_fmt"] = df_exibir["valor_proposto"].apply(lambda x: fmt_moeda(x))
+        df_exibir["valor_total_os_fmt"] = df_exibir["valor_total_os"].apply(lambda x: fmt_moeda(x))
         df_exibir["criado_em"] = pd.to_datetime(df_exibir["criado_em"]).dt.strftime("%d/%m/%Y %H:%M")
 
         df_tabela = df_exibir[[
             "id", "data_proposta", "cliente", "cpf_cnpj", "banco",
             "servico", "item", "valor_proposto_fmt", "valor_total_os_fmt",
             "criado_por", "criado_em",
-        ]].rename(columns={
+        ]].fillna("").rename(columns={
             "id": "Nº",
             "data_proposta": "Data",
             "cliente": "Produtor / Cliente",
@@ -1380,7 +1395,7 @@ with aba5:
 
         c_load, c_exp = st.columns([2, 1])
         op_props = {
-            f"#{r['id']} | {pd.to_datetime(r['data_proposta']).strftime('%d/%m/%Y')} | {r['cliente']} ({r['banco']} — {fmt_moeda(r['valor_proposto'])})": int(r["id"])
+            f"#{r['id']} | {pd.to_datetime(r['data_proposta']).strftime('%d/%m/%Y')} | {r['cliente']} {('(' + r['banco'] + ')') if r['banco'] else ''} {fmt_moeda(r['valor_proposto'])}".strip(): int(r["id"])
             for _, r in df_hist.iterrows()
         }
         prop_sel = c_load.selectbox("Abrir proposta do histórico para editar ou reimprimir:", list(op_props.keys()))
@@ -1410,7 +1425,7 @@ with aba5:
     with st.form("form_nova_contabilidade", clear_on_submit=True):
         nc1, nc2 = st.columns(2)
         novo_nome_cont = nc1.text_input("Nome do Escritório / Contador")
-        novo_cnpj_cont = nc2.text_input("CNPJ (opcional)", placeholder="00.000.000/0000-00")
+        novo_cnpj_cont = nc2.text_input("CNPJ (opcional)")
         if st.form_submit_button("➕ Salvar Contabilidade"):
             if novo_nome_cont.strip():
                 with engine.begin() as conn:
