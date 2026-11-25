@@ -1,23 +1,24 @@
 # ============================================================================
-# ARQUIVO: app.py (Versão 7.0 — Regularize Assessoria Rural)
+# ARQUIVO: app.py (Versão 8.0 — Regularize Assessoria Rural)
 # O QUE ESTE ARQUIVO FAZ:
 #   Sistema web multiusuário em Português do Brasil (PT-BR) conectado ao
 #   PostgreSQL (Supabase), com:
-#   - Campos vazios 100% em branco (sem 0, sem R$ 0,00, sem traços ou máscaras vazias)
-#   - Termo de Proteção de Dados (LGPD) sem trecho de Gov.br e constando
-#     "Instituições financeiras e cooperativas de crédito"
-#   - Busca de CEP corrigida (ViaCEP + BrasilAPI + OpenCEP) puxando Rua/Bairro/Cidade/UF
-#   - Formatação automática de CPF (000.000.000-00) e CNPJ (00.000.000/0000-00)
-#   - Carência de 1 ano, 2 anos e 3 anos + Principais culturas de Minas Gerais
-#   - Linhas de crédito com filtro automático de itens financiáveis e descrições completas
-#   - Margem de Crédito Pessoal e Avalistas separados + Parecer da Agência
-#   - Ordem de Serviço com Valor Cheio (2,00%) + Desconto Concedido da Faixa
-#   - PDFs em Preto e Branco com margens confortáveis, 1 folha A4 equilibrada
-#     por documento e marca d'água oficial da Regularize embutida
+#   - Admin Master: regularizeassessoriarural@gmail.com e regularizesulmg@gmail.com
+#     (acesso total permanente, protegidos contra desativação/exclusão)
+#   - Salvamento Automático ao Trocar de Aba (barra de abas reativa com
+#     detecção inteligente de alterações, sem duplicar propostas e sem perder dados)
+#   - Gestão de Usuários e Tipos de Autorizações (Aba 6 — somente Admin por senha)
+#   - Margem de Crédito Pessoal com caixinhas [ ] para marcar X + Consórcio melhorado
+#   - Ordem de Serviço limpa na impressão (Subtotal, % Desconto, sem parcelamento)
+#     e painel financeiro espaçoso na tela + liberação pontual de desconto pelo Admin
+#   - Análise Produtiva com R$ 0,00 somado ao final e linha inteira para Nome da Propriedade
+#   - Município do Banco / Cooperativa (182 cidades num raio de 150 km de Divino - MG)
+#   - Busca de CEP multi-provedor (ViaCEP -> BrasilAPI -> OpenCEP) e máscaras CPF/CNPJ
+#   - PDFs 100% Preto e Branco, 1 folha A4 equilibrada por documento e marca d'água Regularize
 #
 #   Você NÃO precisa mexer neste arquivo!
-#   - Para alterar dados da empresa/taxas/culturas/linhas: edite config.py
-#   - Para alterar senha do banco ou usuários: edite Settings -> Secrets no Streamlit
+#   - Para alterar dados da empresa/taxas/culturas/linhas/admins: edite config.py
+#   - Para alterar senha do banco ou senha mestra: edite Settings -> Secrets no Streamlit
 # ============================================================================
 
 import hashlib
@@ -27,14 +28,14 @@ import json
 import re
 import secrets
 import urllib.request
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 
 from config import (
-    ADMIN_EMAILS_PADRAO,
+    ADMIN_MASTER_EMAILS,
     BANCOS_PADRAO,
     CARENCIAS_PADRAO,
     CATALOGO_SERVICOS,
@@ -57,13 +58,58 @@ from config import (
 )
 from pdf_generator import fmt_cep, fmt_doc, fmt_moeda, fmt_pct_br, gerar_pdf_bytes
 
+# Fuso horário de Brasília (UTC-3) para exibir horário real do salvamento automático
+FUSO_BRASILIA = timezone(timedelta(hours=-3))
+
 # ============================================================================
-# 1. CONFIGURAÇÃO DA PÁGINA (PORTUGUÊS DO BRASIL)
+# 1. CONFIGURAÇÃO DA PÁGINA E ESTILO VISUAL DAS ABAS REATIVAS
 # ============================================================================
 st.set_page_config(
     page_title=f"Sistema Carta-Proposta | {EMPRESA['nome_fantasia']}",
     page_icon="🌱",
     layout="wide",
+)
+
+# Estilo limpo para que a barra de navegação horizontal tenha visual de abas modernas
+st.markdown(
+    """
+    <style>
+    div[data-testid="stRadio"] > div[role="radiogroup"] {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        border-bottom: 2px solid #E2E8F0;
+        padding-bottom: 8px;
+        margin-bottom: 12px;
+    }
+    div[data-testid="stRadio"] > div[role="radiogroup"] label {
+        background-color: #F8FAFC;
+        border: 1px solid #CBD5E1;
+        border-radius: 8px;
+        padding: 6px 12px !important;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+    div[data-testid="stRadio"] > div[role="radiogroup"] label:hover {
+        border-color: #166534;
+        background-color: #F0FDF4;
+    }
+    div[data-testid="stRadio"] > div[role="radiogroup"] label:has(input:checked) {
+        background-color: #166534 !important;
+        border-color: #166534 !important;
+        color: #FFFFFF !important;
+        font-weight: 600;
+    }
+    div[data-testid="stRadio"] > div[role="radiogroup"] label:has(input:checked) p {
+        color: #FFFFFF !important;
+        font-weight: 600;
+    }
+    div[data-testid="stRadio"] > div[role="radiogroup"] label > div:first-child {
+        display: none;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
@@ -102,7 +148,6 @@ def conectar_banco():
                 "INSERT INTO aux_listas_gerais (categoria, valor) VALUES ('CARENCIA', 'SIM (1 ano)') "
                 "ON CONFLICT (categoria, valor) DO NOTHING"
             ))
-            # Tabela de Usuários e Autorizações (gerenciada pelo Admin dentro do sistema)
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS usuarios_sistema (
                     email VARCHAR(180) PRIMARY KEY,
@@ -126,7 +171,7 @@ engine = conectar_banco()
 
 
 # ============================================================================
-# 3. SEGURANÇA, USUÁRIOS, AUTORIZAÇÕES E VALIDAÇÃO POR SENHA DO ADMIN
+# 3. SEGURANÇA, ADMIN MASTER, USUÁRIOS E AUTORIZAÇÕES POR SENHA
 # ============================================================================
 def gerar_hash_senha(senha_plana):
     """Gera hash seguro (PBKDF2-HMAC-SHA256 com salt aleatório) para salvar senhas no banco."""
@@ -147,9 +192,9 @@ def verificar_senha_hash(senha_plana, hash_salvo):
     return hmac.compare_digest(dk.hex(), hex_esperado)
 
 
-def obter_admins_configurados():
-    """Retorna o conjunto de e-mails de administradores padrão (config.py + Secrets opcional)."""
-    admins = {e.strip().lower() for e in ADMIN_EMAILS_PADRAO}
+def obter_admins_master():
+    """Retorna os e-mails de Administradores Master (config.py + Secrets opcional)."""
+    admins = {e.strip().lower() for e in ADMIN_MASTER_EMAILS}
     extras = st.secrets.get("ADMIN_EMAILS", [])
     if isinstance(extras, str):
         admins.update(x.strip().lower() for x in extras.split(",") if x.strip())
@@ -158,24 +203,32 @@ def obter_admins_configurados():
     return admins
 
 
+def eh_admin_master(email):
+    """Verifica se o e-mail informado é um Administrador Master protegido."""
+    return str(email or "").strip().lower() in obter_admins_master()
+
+
 def sincronizar_usuarios_iniciais():
     """
-    Importa automaticamente (uma única vez, sem sobrescrever) os usuários que já
-    estavam cadastrados nos Secrets do Streamlit para a tabela usuarios_sistema.
-    Assim, nenhum usuário atual perde o acesso e o Admin já pode gerenciar todos na Aba 6!
+    1. Importa automaticamente os usuários dos Secrets para a tabela usuarios_sistema
+       (sem sobrescrever usuários já configurados no banco).
+    2. Garante que TODOS os e-mails em ADMIN_MASTER_EMAILS (incluindo
+       regularizeassessoriarural@gmail.com) estejam sempre promovidos como ADMIN
+       ativo com 100% das permissões, mesmo que já existissem antes como ATENDENTE!
     """
-    admins = obter_admins_configurados()
+    admins_master = obter_admins_master()
     usuarios_secrets = dict(st.secrets.get("usuarios", {}))
-    if not usuarios_secrets:
-        return
+    perms_admin_json = json.dumps(PERFIS_AUTORIZACAO["ADMIN"]["permissoes"], ensure_ascii=False)
+
     try:
         with engine.begin() as conn:
+            # 1. Insere quem ainda não estava na tabela
             for email_raw, senha_raw in usuarios_secrets.items():
                 email = str(email_raw).strip().lower()
                 if not email:
                     continue
-                eh_admin = email in admins
-                perfil = "ADMIN" if eh_admin else "ATENDENTE"
+                eh_adm = email in admins_master
+                perfil = "ADMIN" if eh_adm else "ATENDENTE"
                 perms = dict(PERFIS_AUTORIZACAO[perfil]["permissoes"])
                 nome_padrao = email.split("@")[0].replace(".", " ").title()
                 conn.execute(
@@ -192,12 +245,28 @@ def sincronizar_usuarios_iniciais():
                         "perms": json.dumps(perms, ensure_ascii=False),
                     },
                 )
+
+            # 2. Promove automaticamente todo Admin Master já existente no banco (ex.: regularizeassessoriarural@gmail.com)
+            for email_master in admins_master:
+                conn.execute(
+                    text("""
+                        UPDATE usuarios_sistema
+                        SET perfil = 'ADMIN',
+                            ativo = TRUE,
+                            permissoes = CAST(:perms AS jsonb),
+                            atualizado_em = NOW()
+                        WHERE LOWER(email) = :e
+                          AND (perfil <> 'ADMIN' OR ativo = FALSE OR COALESCE((permissoes->>'gerenciar_usuarios')::boolean, FALSE) = FALSE)
+                    """),
+                    {"perms": perms_admin_json, "e": email_master},
+                )
     except Exception:
         pass
 
 
 def carregar_usuario_db(email):
     """Busca dados e autorizações atualizadas do usuário no PostgreSQL."""
+    e_norm = str(email or "").strip().lower()
     with engine.connect() as conn:
         row = conn.execute(
             text("""
@@ -205,28 +274,34 @@ def carregar_usuario_db(email):
                 FROM usuarios_sistema
                 WHERE LOWER(email) = :e
             """),
-            {"e": str(email).strip().lower()},
+            {"e": e_norm},
         ).mappings().first()
     if not row:
         return None
-    perms = dict(PERFIS_AUTORIZACAO.get(row["perfil"], PERFIS_AUTORIZACAO["ATENDENTE"])["permissoes"])
-    if isinstance(row["permissoes"], dict):
-        perms.update({k: bool(v) for k, v in row["permissoes"].items()})
+    eh_master = eh_admin_master(row["email"])
+    perfil_efetivo = "ADMIN" if eh_master else row["perfil"]
+    if eh_master or perfil_efetivo == "ADMIN":
+        perms = dict(PERFIS_AUTORIZACAO["ADMIN"]["permissoes"])
+    else:
+        perms = dict(PERFIS_AUTORIZACAO.get(perfil_efetivo, PERFIS_AUTORIZACAO["ATENDENTE"])["permissoes"])
+        if isinstance(row["permissoes"], dict):
+            perms.update({k: bool(v) for k, v in row["permissoes"].items()})
     return {
         "email": row["email"].strip().lower(),
         "nome": row["nome"] or row["email"].split("@")[0].title(),
         "senha_hash": row["senha_hash"],
-        "perfil": row["perfil"],
-        "ativo": bool(row["ativo"]),
+        "perfil": perfil_efetivo,
+        "eh_master": eh_master,
+        "ativo": True if eh_master else bool(row["ativo"]),
         "permissoes": perms,
     }
 
 
 def validar_senha_admin(senha_digitada):
     """
-    Confirma se a senha informada pertence a um Administrador ativo (ou à SENHA_ADMIN
-    nos Secrets, caso configurada). Apenas com esta validação o sistema permite
-    adicionar usuários, alterar autorizações ou liberar descontos restritos!
+    Confirma se a senha informada pertence a um Administrador ativo (incluindo os
+    Admins Master regularizeassessoriarural@gmail.com e regularizesulmg@gmail.com)
+    ou à SENHA_ADMIN configurada nos Secrets.
     """
     if not senha_digitada:
         return False
@@ -253,10 +328,10 @@ def validar_senha_admin(senha_digitada):
     except Exception:
         pass
 
-    # 3. Fallback: senha do e-mail Admin cadastrado nos Secrets
-    admins_padrao = obter_admins_configurados()
+    # 3. Fallback: senha de qualquer Admin Master nos Secrets
+    admins_master = obter_admins_master()
     usuarios_secrets = {k.strip().lower(): str(v) for k, v in dict(st.secrets.get("usuarios", {})).items()}
-    for e_adm in admins_padrao:
+    for e_adm in admins_master:
         if e_adm in usuarios_secrets and hmac.compare_digest(str(senha_digitada), usuarios_secrets[e_adm]):
             return True
 
@@ -265,9 +340,11 @@ def validar_senha_admin(senha_digitada):
 
 def tem_permissao(chave):
     """Verifica se o usuário logado possui determinada autorização."""
-    perms = st.session_state.get("usuario_permissoes") or {}
+    if eh_admin_master(st.session_state.get("usuario_logado")):
+        return True
     if st.session_state.get("usuario_perfil") == "ADMIN":
         return True
+    perms = st.session_state.get("usuario_permissoes") or {}
     return bool(perms.get(chave, False))
 
 
@@ -277,13 +354,12 @@ def pode_dar_desconto_os():
 
 
 def verificar_login():
-    """Autentica o usuário na tabela usuarios_sistema (com sincronização automática dos Secrets)."""
+    """Autentica o usuário na tabela usuarios_sistema (sincronizando Secrets e promovendo Admins Master)."""
     if not st.session_state.get("_usuarios_sincronizados"):
         sincronizar_usuarios_iniciais()
         st.session_state["_usuarios_sincronizados"] = True
 
     if st.session_state.get("usuario_logado"):
-        # Atualiza as permissões ao vivo a cada interação (se o Admin revogar/liberar, vale na hora!)
         u_live = carregar_usuario_db(st.session_state["usuario_logado"])
         if u_live:
             if not u_live["ativo"]:
@@ -320,12 +396,10 @@ def verificar_login():
                     else:
                         st.error("E-mail ou senha incorretos. Verifique com a administração.")
                 else:
-                    # Fallback caso um novo usuário tenha sido colado apenas nos Secrets
                     usuarios_permitidos = dict(st.secrets.get("usuarios", {}))
                     mapa_lower = {k.strip().lower(): str(v) for k, v in usuarios_permitidos.items()}
                     if email in mapa_lower and senha == mapa_lower[email]:
-                        eh_adm = email in obter_admins_configurados()
-                        perf = "ADMIN" if eh_adm else "ATENDENTE"
+                        perf = "ADMIN" if eh_admin_master(email) else "ATENDENTE"
                         st.session_state["usuario_logado"] = email
                         st.session_state["usuario_nome"] = email.split("@")[0].title()
                         st.session_state["usuario_perfil"] = perf
@@ -351,7 +425,6 @@ def normalizar_espacos(texto):
 
 
 def num_float_ou_none(valor):
-    """Retorna float > 0 ou None (mantém campos vazios 100% em branco na tela)."""
     if valor is None or str(valor).strip() == "":
         return None
     try:
@@ -362,7 +435,6 @@ def num_float_ou_none(valor):
 
 
 def num_int_ou_none(valor):
-    """Retorna int > 0 ou None (mantém campos inteiros vazios 100% em branco na tela)."""
     if valor is None or str(valor).strip() == "":
         return None
     try:
@@ -378,53 +450,43 @@ def buscar_cep_online(cep_texto):
     if len(dig) != 8:
         return None
 
-    headers = {"User-Agent": "Mozilla/5.0 (SistemaRegularize/4.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (SistemaRegularize/8.0)"}
 
-    try:
-        req = urllib.request.Request(f"https://viacep.com.br/ws/{dig}/json/", headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            d = json.loads(resp.read().decode("utf-8"))
-            if not d.get("erro"):
-                return {
-                    "cep": fmt_cep(dig),
-                    "rua": (d.get("logradouro") or "").strip(),
-                    "bairro": (d.get("bairro") or "").strip(),
-                    "cidade": (d.get("localidade") or "").strip(),
-                    "uf": (d.get("uf") or "").strip().upper(),
-                }
-    except Exception:
-        pass
-
-    try:
-        req = urllib.request.Request(f"https://brasilapi.com.br/api/cep/v2/{dig}", headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            d = json.loads(resp.read().decode("utf-8"))
-            if d.get("city"):
-                return {
-                    "cep": fmt_cep(dig),
-                    "rua": (d.get("street") or "").strip(),
-                    "bairro": (d.get("neighborhood") or "").strip(),
-                    "cidade": (d.get("city") or "").strip(),
-                    "uf": (d.get("state") or "").strip().upper(),
-                }
-    except Exception:
-        pass
-
-    try:
-        req = urllib.request.Request(f"https://opencep.com/v1/{dig}.json", headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            d = json.loads(resp.read().decode("utf-8"))
-            if d.get("localidade"):
-                return {
-                    "cep": fmt_cep(dig),
-                    "rua": (d.get("logradouro") or "").strip(),
-                    "bairro": (d.get("bairro") or "").strip(),
-                    "cidade": (d.get("localidade") or "").strip(),
-                    "uf": (d.get("uf") or "").strip().upper(),
-                }
-    except Exception:
-        pass
-
+    for url, modo in [
+        (f"https://viacep.com.br/ws/{dig}/json/", "viacep"),
+        (f"https://brasilapi.com.br/api/cep/v2/{dig}", "brasilapi"),
+        (f"https://opencep.com/v1/{dig}.json", "opencep"),
+    ]:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                d = json.loads(resp.read().decode("utf-8"))
+                if modo == "viacep" and not d.get("erro"):
+                    return {
+                        "cep": fmt_cep(dig),
+                        "rua": (d.get("logradouro") or "").strip(),
+                        "bairro": (d.get("bairro") or "").strip(),
+                        "cidade": (d.get("localidade") or "").strip(),
+                        "uf": (d.get("uf") or "").strip().upper(),
+                    }
+                if modo == "brasilapi" and d.get("city"):
+                    return {
+                        "cep": fmt_cep(dig),
+                        "rua": (d.get("street") or "").strip(),
+                        "bairro": (d.get("neighborhood") or "").strip(),
+                        "cidade": (d.get("city") or "").strip(),
+                        "uf": (d.get("state") or "").strip().upper(),
+                    }
+                if modo == "opencep" and d.get("localidade"):
+                    return {
+                        "cep": fmt_cep(dig),
+                        "rua": (d.get("logradouro") or "").strip(),
+                        "bairro": (d.get("bairro") or "").strip(),
+                        "cidade": (d.get("localidade") or "").strip(),
+                        "uf": (d.get("uf") or "").strip().upper(),
+                    }
+        except Exception:
+            continue
     return None
 
 
@@ -494,13 +556,36 @@ def _propriedade_vazia():
     }
 
 
+# Lista de campos escalares que têm widgets na tela (separados por prefixo _w_ para
+# nunca perder dados ao trocar entre abas no Streamlit!)
+CAMPOS_ESCALARES = [
+    "local_emissao", "data_proposta", "parceiro", "banco_destino",
+    "banco_municipio", "banco_municipio_custom",
+    "cliente_cpf", "cliente_nome", "cliente_telefone", "tipo_cliente",
+    "cep", "rua", "localidade", "bairro", "cidade", "uf",
+    "contabilidade_nome", "imovel_beneficiado_texto",
+    "filtro_linha_credito", "tipo_servico", "descricao_servico",
+    "item_financiado", "item_financiado_custom", "cultura", "carencia",
+    "valor_proposto", "tipo_envio_docs", "data_envio_docs",
+    "faixa_honorario_idx", "desconto_extra", "acrescimos", "forma_pagamento",
+    "avalista_nome", "avalista_cpf", "conjuge_avalista_nome", "conjuge_avalista_cpf",
+    "credito_modalidades", "credito_valor", "parcela_consorcio", "num_parcelas_consorcio",
+    "parecer_agencia",
+    "renda_extra_1_desc", "renda_extra_1_val",
+    "renda_extra_2_desc", "renda_extra_2_val", "bens",
+]
+
+
 def inicializar_estado_proposta():
-    """Inicializa os campos isolados na sessão do usuário (campos opcionais começam em branco)."""
-    primeiro_serv = "PRONAF - CUSTEIO AGRÍCOLA"
+    """Inicializa os campos isolados na sessão do usuário atual."""
     padrao = {
         "proposta_id_edicao": None,
         "proposta_criado_por": None,
         "desconto_liberado_por_admin": False,
+        "auto_save_ativo": True,
+        "_ultimo_hash_salvo": None,
+        "_ultimo_autosave_txt": "",
+        "_toast_autosave": "",
         "local_emissao": EMPRESA["cidade_padrao"],
         "data_proposta": date.today(),
         "parceiro": EMPRESA["nome_fantasia"],
@@ -565,32 +650,124 @@ def inicializar_estado_proposta():
 
 
 # ============================================================================
-# 5. CALLBACKS (ATUALIZAÇÃO IMEDIATA DOS CAMPOS NA TELA)
+# 5. SINCRONIZAÇÃO DE WIDGETS E SALVAMENTO AUTOMÁTICO AO TROCAR DE ABA
 # ============================================================================
-def cb_formatar_doc(chave_campo):
-    """Formata automaticamente CPF (000.000.000-00) ou CNPJ (00.000.000/0000-00)."""
-    atual = st.session_state.get(chave_campo, "")
-    st.session_state[chave_campo] = fmt_doc(atual)
+def limpar_chaves_widgets():
+    """Remove chaves temporárias _w_* para os campos recarregarem do estado principal."""
+    for k in list(st.session_state.keys()):
+        if k.startswith("_w_"):
+            del st.session_state[k]
+
+
+def definir_campo(chave, valor):
+    """Atualiza tanto o dado principal quanto o widget correspondente (se visível)."""
+    st.session_state[chave] = valor
+    wk = f"_w_{chave}"
+    if wk in st.session_state:
+        st.session_state[wk] = valor
+
+
+def preparar_widget(chave):
+    """Garante que o widget _w_<chave> comece com o valor atual sem disparar avisos."""
+    wk = f"_w_{chave}"
+    if wk not in st.session_state:
+        st.session_state[wk] = st.session_state.get(chave)
+    return wk
+
+
+def preparar_widget_lista(chave, opcoes):
+    """Garante que um selectbox tenha valor válido dentro de opcoes sem avisos."""
+    wk = f"_w_{chave}"
+    atual = st.session_state.get(chave)
+    if atual not in opcoes:
+        atual = opcoes[0] if opcoes else ""
+        st.session_state[chave] = atual
+    if wk not in st.session_state or st.session_state[wk] not in opcoes:
+        st.session_state[wk] = atual
+    return wk
+
+
+def cb_sync_campo(chave, formatar_doc=False):
+    """Copia o valor digitado no widget _w_<chave> para o estado principal."""
+    wk = f"_w_{chave}"
+    if wk in st.session_state:
+        val = st.session_state[wk]
+        if formatar_doc:
+            val = fmt_doc(val)
+            st.session_state[wk] = val
+        st.session_state[chave] = val
+
+
+def sincronizar_widgets_para_estado():
+    """
+    Garante que TODOS os campos da aba atual sejam copiados dos widgets (_w_*)
+    para o estado principal ANTES de salvar ou trocar de aba.
+    """
+    # 1. Campos escalares
+    for campo in CAMPOS_ESCALARES:
+        wk = f"_w_{campo}"
+        if wk in st.session_state:
+            val = st.session_state[wk]
+            if campo in ("cliente_cpf", "avalista_cpf", "conjuge_avalista_cpf"):
+                val = fmt_doc(val)
+            st.session_state[campo] = val
+
+    # 2. Checklist de Documentos
+    chk = st.session_state.get("checklist_docs", {})
+    for k in list(st.session_state.keys()):
+        if k.startswith("_w_chk_"):
+            chave_doc = k[len("_w_chk_"):]
+            chk[chave_doc] = bool(st.session_state[k])
+    st.session_state["checklist_docs"] = chk
+
+    # 3. Propriedades da Análise Produtiva
+    props = st.session_state.get("propriedades_lista", [])
+    mapa_prop_campos = {
+        "nome": "nome", "mat": "matricula", "pes": "num_pes", "esp": "espacamento",
+        "var": "variedades", "id": "idade", "pr27": "prev_2027",
+        "p26": "prod_2026", "p25": "prod_2025", "p24": "prod_2024",
+        "v26": "venda_2026", "v25": "venda_2025", "v24": "venda_2024",
+    }
+    for idx, p in enumerate(props):
+        for pref, campo_p in mapa_prop_campos.items():
+            wk = f"_w_p_{pref}_{idx}"
+            if wk in st.session_state:
+                p[campo_p] = st.session_state[wk]
+
+    # 4. Semoventes da Análise Produtiva
+    sem = st.session_state.get("semoventes", {})
+    for campo_s in ("vacas_leite", "litros_dia", "preco_litro", "boi_corte", "novilhas", "bezerros"):
+        wk = f"_w_sem_{campo_s}"
+        if wk in st.session_state:
+            sem[campo_s] = st.session_state[wk]
+    st.session_state["semoventes"] = sem
+
+
+def _calcular_hash_proposta(d):
+    """Cria uma assinatura única dos dados atuais para só auto-salvar quando houver alteração real."""
+    payload = json.dumps(d, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def cb_buscar_cep():
     """Consulta o CEP antes de redesenhar a tela e preenche Rua, Bairro, Cidade e UF."""
+    sincronizar_widgets_para_estado()
     cep_digitado = st.session_state.get("cep", "")
     dig = apenas_digitos(cep_digitado)
     if len(dig) != 8:
         st.session_state["aviso_cep"] = "erro:Digite um CEP válido com 8 números."
         return
 
-    st.session_state["cep"] = fmt_cep(dig)
+    definir_campo("cep", fmt_cep(dig))
     res = buscar_cep_online(dig)
     if not res:
         st.session_state["aviso_cep"] = "erro:CEP não encontrado nos Correios. Confira os números ou preencha o endereço manualmente."
         return
 
-    st.session_state["cidade"] = res["cidade"] or st.session_state.get("cidade", "")
-    st.session_state["uf"] = res["uf"] or st.session_state.get("uf", "MG")
-    st.session_state["bairro"] = res["bairro"]
-    st.session_state["rua"] = res["rua"]
+    definir_campo("cidade", res["cidade"] or st.session_state.get("cidade", ""))
+    definir_campo("uf", res["uf"] or st.session_state.get("uf", "MG"))
+    definir_campo("bairro", res["bairro"])
+    definir_campo("rua", res["rua"])
 
     if res["rua"]:
         st.session_state["aviso_cep"] = f"ok:Endereço encontrado: {res['rua']} — {res['bairro']} ({res['cidade']}/{res['uf']})."
@@ -601,35 +778,40 @@ def cb_buscar_cep():
 
 
 def cb_limpar_formulario():
-    chaves_manter = {"usuario_logado", "usuario_nome", "usuario_perfil", "usuario_permissoes", "_usuarios_sincronizados"}
+    chaves_manter = {
+        "usuario_logado", "usuario_nome", "usuario_perfil",
+        "usuario_permissoes", "_usuarios_sincronizados", "auto_save_ativo",
+    }
     for k in list(st.session_state.keys()):
         if k not in chaves_manter:
             del st.session_state[k]
     inicializar_estado_proposta()
+    st.session_state["_nav_aba"] = "📋 1. Nova Proposta & Cliente"
 
 
 def cb_ao_trocar_servico(catalogo):
     """Atualiza automaticamente a Descrição do Serviço e limpa/ajusta o item daquela linha."""
+    cb_sync_campo("tipo_servico")
     serv = st.session_state.get("tipo_servico", "")
     info = catalogo.get(serv)
     if info:
-        st.session_state["descricao_servico"] = info.get("descricao", "")
+        definir_campo("descricao_servico", info.get("descricao", ""))
         itens_linha = info.get("itens", [])
         if st.session_state.get("item_financiado") not in itens_linha:
-            st.session_state["item_financiado"] = ""
+            definir_campo("item_financiado", "")
     else:
-        st.session_state["descricao_servico"] = ""
-        st.session_state["item_financiado"] = ""
+        definir_campo("descricao_servico", "")
+        definir_campo("item_financiado", "")
 
 
 def cb_aplicar_imovel_salvo():
-    esc = st.session_state.get("seletor_imovel_salvo", "")
+    esc = st.session_state.get("_w_seletor_imovel_salvo", "")
     if esc:
-        st.session_state["imovel_beneficiado_texto"] = esc
+        definir_campo("imovel_beneficiado_texto", esc)
 
 
 def cb_carregar_cliente(cpf_cnpj):
-    """Carrega cliente + propriedades + contabilidade do PostgreSQL antes da renderização."""
+    """Carrega cliente + propriedades + contabilidade do PostgreSQL."""
     with engine.connect() as conn:
         cli = conn.execute(
             text("""
@@ -658,6 +840,7 @@ def cb_carregar_cliente(cpf_cnpj):
             {"cpf": cpf_cnpj},
         ).mappings().all()
 
+    limpar_chaves_widgets()
     st.session_state["cliente_cpf"] = fmt_doc(cli["cpf_cnpj"])
     st.session_state["cliente_nome"] = cli["nome"] or ""
     st.session_state["cliente_telefone"] = cli["telefone"] or ""
@@ -695,7 +878,7 @@ def cb_carregar_cliente(cpf_cnpj):
 
 
 def cb_carregar_proposta(proposta_id):
-    """Carrega uma proposta salva do histórico (mantendo zeros não usados como vazios)."""
+    """Carrega uma proposta salva do histórico para edição ou reimpressão."""
     with engine.connect() as conn:
         row = conn.execute(
             text("SELECT * FROM propostas WHERE id = :pid"),
@@ -706,6 +889,7 @@ def cb_carregar_proposta(proposta_id):
         return
 
     cb_carregar_cliente(row["cliente_cpf_cnpj"])
+    limpar_chaves_widgets()
     st.session_state["proposta_id_edicao"] = row["id"]
     st.session_state["proposta_criado_por"] = row.get("criado_por") or ""
     st.session_state["desconto_liberado_por_admin"] = False
@@ -773,9 +957,13 @@ def cb_carregar_proposta(proposta_id):
     st.session_state["renda_extra_2_val"] = float(prod.get("renda_extra_2_val") or 0.0)
     st.session_state["bens"] = prod.get("bens", "")
 
+    # Marca o estado carregado como já salvo (evita gravação desnecessária antes de editar)
+    st.session_state["_ultimo_hash_salvo"] = _calcular_hash_proposta(montar_dicionario_proposta())
+    st.session_state["_nav_aba"] = "📋 1. Nova Proposta & Cliente"
+
 
 # ============================================================================
-# 6. CÁLCULOS FINANCEIROS (VALOR CHEIO 2% + DESCONTO DA FAIXA)
+# 6. CÁLCULOS FINANCEIROS E SALVAMENTO (MANUAL + AUTOMÁTICO AO TROCAR DE ABA)
 # ============================================================================
 def montar_dicionario_proposta():
     """Calcula Honorários Cheios (2,00%), Desconto da Faixa, Total OS e Renda Bruta."""
@@ -881,34 +1069,43 @@ def montar_dicionario_proposta():
             "bens": st.session_state.get("bens", ""),
         },
         "soma_vendas_2026": round(soma_vendas, 2),
-        "soma_rendas_extras": round(float(st.session_state.get("renda_extra_1_val") or 0.0) + float(st.session_state.get("renda_extra_2_val") or 0.0), 2),
+        "soma_rendas_extras": round(
+            float(st.session_state.get("renda_extra_1_val") or 0.0)
+            + float(st.session_state.get("renda_extra_2_val") or 0.0),
+            2,
+        ),
         "renda_bruta_anual": round(renda_bruta, 2),
     }
 
 
-def salvar_tudo_no_banco():
-    """Salva Cliente, Propriedades e Proposta de forma atômica no PostgreSQL (validando autorizações)."""
+def salvar_tudo_no_banco(silencioso=False):
+    """Salva Cliente, Propriedades e Proposta de forma atômica no PostgreSQL."""
+    sincronizar_widgets_para_estado()
+
     if not tem_permissao("criar_editar_proposta"):
-        st.error("⛔ Seu usuário tem autorização apenas de consulta. Solicite ao Administrador para liberar gravação.")
+        if not silencioso:
+            st.error("⛔ Seu usuário tem autorização apenas de consulta. Solicite ao Administrador para liberar gravação.")
         return None
 
     pid_edit_check = st.session_state.get("proposta_id_edicao")
     dono_prop = str(st.session_state.get("proposta_criado_por") or "").strip().lower()
     if pid_edit_check and dono_prop and dono_prop != usuario_atual and not tem_permissao("editar_proposta_outros"):
-        st.error(f"⛔ Esta proposta pertence a '{dono_prop}'. Você não tem autorização para editar propostas de outros atendentes.")
+        if not silencioso:
+            st.error(f"⛔ Esta proposta pertence a '{dono_prop}'. Você não tem autorização para editar propostas de outros atendentes.")
         return None
 
-    # Se o usuário não tem autorização de desconto e o Admin não liberou nesta proposta, trava em 2,00%
     if not pode_dar_desconto_os():
-        st.session_state["faixa_honorario_idx"] = 2
-        st.session_state["desconto_extra"] = None
+        definir_campo("faixa_honorario_idx", 2)
+        definir_campo("desconto_extra", None)
 
     d = montar_dicionario_proposta()
     if len(d["cliente_cpf"]) not in (11, 14):
-        st.error("❌ Informe um CPF (11 números) ou CNPJ (14 números) válido antes de salvar.")
+        if not silencioso:
+            st.error("❌ Informe um CPF (11 números) ou CNPJ (14 números) válido antes de salvar.")
         return None
     if not d["cliente_nome"]:
-        st.error("❌ Preencha o Nome Completo do Produtor antes de salvar.")
+        if not silencioso:
+            st.error("❌ Preencha o Nome Completo do Produtor antes de salvar.")
         return None
 
     with engine.begin() as conn:
@@ -1071,9 +1268,9 @@ def salvar_tudo_no_banco():
                 """),
                 params_prop,
             )
-            return pid_edit
+            pid_final = pid_edit
         else:
-            novo_id = conn.execute(
+            pid_final = conn.execute(
                 text("""
                     INSERT INTO propostas (
                         data_proposta, local_emissao, parceiro, banco_destino, banco_municipio,
@@ -1106,22 +1303,70 @@ def salvar_tudo_no_banco():
                 """),
                 params_prop,
             ).scalar()
-            st.session_state["proposta_id_edicao"] = novo_id
-            return novo_id
+            st.session_state["proposta_id_edicao"] = pid_final
+            st.session_state["proposta_criado_por"] = usuario_atual
+
+    st.session_state["_ultimo_hash_salvo"] = _calcular_hash_proposta(d)
+    hora_agora = datetime.now(FUSO_BRASILIA).strftime("%H:%M:%S")
+    st.session_state["_ultimo_autosave_txt"] = f"Proposta #{pid_final} salva às {hora_agora}"
+    return pid_final
+
+
+def cb_trocar_aba():
+    """
+    MECANISMO DE SALVAMENTO AUTOMÁTICO AO TROCAR DE ABA:
+    1. Sincroniza todos os campos digitados na aba que o usuário acabou de sair.
+    2. Se o salvamento automático estiver ativado, o usuário tiver permissão,
+       Nome + CPF/CNPJ válidos estiverem preenchidos e houver alteração real
+       desde a última gravação, salva automaticamente no PostgreSQL!
+    """
+    sincronizar_widgets_para_estado()
+
+    if not st.session_state.get("auto_save_ativo", True):
+        return
+    if not tem_permissao("criar_editar_proposta"):
+        return
+
+    d_atual = montar_dicionario_proposta()
+    if len(d_atual["cliente_cpf"]) not in (11, 14) or not d_atual["cliente_nome"]:
+        return
+
+    hash_atual = _calcular_hash_proposta(d_atual)
+    if hash_atual == st.session_state.get("_ultimo_hash_salvo"):
+        return
+
+    try:
+        pid = salvar_tudo_no_banco(silencioso=True)
+        if pid:
+            hora_agora = datetime.now(FUSO_BRASILIA).strftime("%H:%M:%S")
+            msg = f"💾 Salvo automaticamente às {hora_agora} (Proposta #{pid})"
+            st.session_state["_toast_autosave"] = msg
+            st.session_state["_ultimo_autosave_txt"] = f"Auto-salvo às {hora_agora} (Proposta #{pid})"
+    except Exception as exc:
+        st.session_state["_toast_autosave"] = f"⚠️ Aviso no salvamento automático: {exc}"
 
 
 # ============================================================================
-# 7. INICIALIZAÇÃO E BARRA LATERAL
+# 7. INICIALIZAÇÃO, BARRA LATERAL E BARRA DE ABAS REATIVA
 # ============================================================================
 inicializar_estado_proposta()
 catalogo_servicos, listas_cat, df_contabilidades = carregar_listas_auxiliares()
+
+# Exibe notificação discreta quando o salvamento automático acabou de acontecer
+if st.session_state.get("_toast_autosave"):
+    st.toast(st.session_state["_toast_autosave"])
+    st.session_state["_toast_autosave"] = ""
 
 with st.sidebar:
     st.markdown(f"### 🌱 {EMPRESA['nome_fantasia']}")
     nome_exib_user = st.session_state.get("usuario_nome") or usuario_atual
     perfil_exib_user = st.session_state.get("usuario_perfil", "ATENDENTE")
+    eh_master_atual = eh_admin_master(usuario_atual)
     st.caption(f"👤 **{nome_exib_user}** ({usuario_atual})")
-    st.caption(f"🛡️ Perfil: **{perfil_exib_user}**")
+    if eh_master_atual:
+        st.caption("👑 Perfil: **ADMIN MASTER**")
+    else:
+        st.caption(f"🛡️ Perfil: **{perfil_exib_user}**")
 
     if st.session_state.get("proposta_id_edicao"):
         st.info(f"✏️ Editando Proposta **#{st.session_state['proposta_id_edicao']}**")
@@ -1132,9 +1377,19 @@ with st.sidebar:
 
     if tem_permissao("criar_editar_proposta"):
         if st.button("💾 Salvar Proposta Agora", type="primary", use_container_width=True):
-            pid = salvar_tudo_no_banco()
+            pid = salvar_tudo_no_banco(silencioso=False)
             if pid:
                 st.success(f"✅ Proposta #{pid} salva com sucesso!")
+
+        st.toggle(
+            "🔄 Salvar automaticamente ao trocar de aba",
+            key="auto_save_ativo",
+            help="Quando ativado, ao clicar em qualquer outra aba o sistema grava automaticamente as alterações no banco de dados (desde que Nome e CPF/CNPJ estejam preenchidos).",
+        )
+        if st.session_state.get("_ultimo_autosave_txt"):
+            st.caption(f"🕒 {st.session_state['_ultimo_autosave_txt']}")
+        elif st.session_state.get("auto_save_ativo"):
+            st.caption("🕒 Salvamento automático ativo (preencha Nome + CPF/CNPJ).")
     else:
         st.warning("🔒 Modo Somente Consulta")
 
@@ -1145,8 +1400,7 @@ with st.sidebar:
 
 
 # ============================================================================
-# 8. ABAS PRINCIPAIS DO SISTEMA (100% PORTUGUÊS DO BRASIL)
-#    A Aba 6 (Administração) só aparece para Administradores autorizados!
+# 8. NAVEGAÇÃO PRINCIPAL POR ABAS REATIVAS (COM SALVAMENTO AUTOMÁTICO)
 # ============================================================================
 titulos_abas = [
     "📋 1. Nova Proposta & Cliente",
@@ -1159,14 +1413,23 @@ eh_admin_painel = tem_permissao("gerenciar_usuarios")
 if eh_admin_painel:
     titulos_abas.append("🔐 6. Administração (Usuários)")
 
-abas_criadas = st.tabs(titulos_abas)
-aba1, aba2, aba3, aba4, aba5 = abas_criadas[:5]
-aba6_admin = abas_criadas[5] if eh_admin_painel else None
+if "_nav_aba" not in st.session_state or st.session_state["_nav_aba"] not in titulos_abas:
+    st.session_state["_nav_aba"] = titulos_abas[0]
+
+aba_ativa = st.radio(
+    "Navegação do Sistema",
+    options=titulos_abas,
+    horizontal=True,
+    label_visibility="collapsed",
+    key="_nav_aba",
+    on_change=cb_trocar_aba,
+)
+
 
 # ----------------------------------------------------------------------------
 # ABA 1: NOVA PROPOSTA & CADASTRO DO CLIENTE
 # ----------------------------------------------------------------------------
-with aba1:
+if aba_ativa == "📋 1. Nova Proposta & Cliente":
     st.subheader("🔍 Pesquisar Cliente Cadastrado")
     termo_cli = st.text_input(
         "Digite parte do Nome ou CPF/CNPJ para carregar dados e imóveis salvos:",
@@ -1205,51 +1468,71 @@ with aba1:
     st.subheader("📄 Dados da Proposta e do Produtor")
 
     c1, c2, c3 = st.columns([1.2, 1.0, 1.8])
-    c1.text_input("Local de Emissão", key="local_emissao")
-    c2.date_input("Data da Proposta", key="data_proposta", format="DD/MM/YYYY")
-    c3.text_input("Parceiro / Escritório", key="parceiro")
+    c1.text_input("Local de Emissão", key=preparar_widget("local_emissao"), on_change=cb_sync_campo, args=("local_emissao",))
+    c2.date_input("Data da Proposta", key=preparar_widget("data_proposta"), format="DD/MM/YYYY", on_change=cb_sync_campo, args=("data_proposta",))
+    c3.text_input("Parceiro / Escritório", key=preparar_widget("parceiro"), on_change=cb_sync_campo, args=("parceiro",))
 
     b1, b2 = st.columns([1.4, 2.6])
     bancos_lista = [""] + listas_cat["BANCO"]
-    if st.session_state["banco_destino"] not in bancos_lista:
+    if st.session_state["banco_destino"] and st.session_state["banco_destino"] not in bancos_lista:
         bancos_lista.append(st.session_state["banco_destino"])
-    b1.selectbox("Banco / Cooperativa de Destino", bancos_lista, key="banco_destino")
+    b1.selectbox(
+        "Banco / Cooperativa de Destino",
+        bancos_lista,
+        key=preparar_widget_lista("banco_destino", bancos_lista),
+        on_change=cb_sync_campo,
+        args=("banco_destino",),
+    )
 
     opcoes_mun_banco = [""] + MUNICIPIOS_BANCOS_150KM_DIVINO + ["OUTRO MUNICÍPIO (DIGITAR MANUALMENTE)"]
-    if st.session_state["banco_municipio"] not in opcoes_mun_banco:
+    if st.session_state["banco_municipio"] and st.session_state["banco_municipio"] not in opcoes_mun_banco:
         opcoes_mun_banco.insert(1, st.session_state["banco_municipio"])
     b2.selectbox(
         "Município do Banco / Cooperativa (raio de 150 km de Divino - MG)",
         opcoes_mun_banco,
-        key="banco_municipio",
+        key=preparar_widget_lista("banco_municipio", opcoes_mun_banco),
+        on_change=cb_sync_campo,
+        args=("banco_municipio",),
         help="Digite o nome da cidade para buscar rapidamente entre os 182 municípios de MG, ES e RJ num raio de 150 km de Divino - MG.",
     )
     if st.session_state["banco_municipio"] == "OUTRO MUNICÍPIO (DIGITAR MANUALMENTE)":
-        b2.text_input("Digite o Município e UF do Banco / Cooperativa:", key="banco_municipio_custom", placeholder="Ex.: Juiz de Fora - MG")
+        b2.text_input(
+            "Digite o Município e UF do Banco / Cooperativa:",
+            key=preparar_widget("banco_municipio_custom"),
+            on_change=cb_sync_campo,
+            args=("banco_municipio_custom",),
+            placeholder="Ex.: Juiz de Fora - MG",
+        )
 
     p1, p2, p3, p4 = st.columns([2.2, 1.4, 1.2, 1.2])
-    p1.text_input("Nome Completo do Produtor *", key="cliente_nome")
+    p1.text_input("Nome Completo do Produtor *", key=preparar_widget("cliente_nome"), on_change=cb_sync_campo, args=("cliente_nome",))
     p2.text_input(
         "CPF ou CNPJ *",
-        key="cliente_cpf",
+        key=preparar_widget("cliente_cpf"),
         help="Digite apenas números e aperte Enter/Tab: os pontos, traço e barra entram automaticamente.",
-        on_change=cb_formatar_doc,
-        args=("cliente_cpf",),
+        on_change=cb_sync_campo,
+        args=("cliente_cpf", True),
     )
-    p3.text_input("Telefone / WhatsApp", key="cliente_telefone")
+    p3.text_input("Telefone / WhatsApp", key=preparar_widget("cliente_telefone"), on_change=cb_sync_campo, args=("cliente_telefone",))
     tipos_cli = [""] + listas_cat["TIPO_CLIENTE"]
-    if st.session_state["tipo_cliente"] not in tipos_cli:
+    if st.session_state["tipo_cliente"] and st.session_state["tipo_cliente"] not in tipos_cli:
         tipos_cli.append(st.session_state["tipo_cliente"])
-    p4.selectbox("Tipo de Cliente", tipos_cli, key="tipo_cliente")
+    p4.selectbox(
+        "Tipo de Cliente",
+        tipos_cli,
+        key=preparar_widget_lista("tipo_cliente", tipos_cli),
+        on_change=cb_sync_campo,
+        args=("tipo_cliente",),
+    )
 
     # Endereço com busca automática de CEP
     e1, e_btn, e2, e3 = st.columns([1.2, 0.9, 2.5, 1.4])
-    e1.text_input("CEP", key="cep")
+    e1.text_input("CEP", key=preparar_widget("cep"), on_change=cb_sync_campo, args=("cep",))
     e_btn.write("")
     e_btn.write("")
     e_btn.button("🔎 Buscar CEP", on_click=cb_buscar_cep, use_container_width=True)
-    e2.text_input("Rua / Logradouro", key="rua")
-    e3.text_input("Localidade / Comunidade", key="localidade")
+    e2.text_input("Rua / Logradouro", key=preparar_widget("rua"), on_change=cb_sync_campo, args=("rua",))
+    e3.text_input("Localidade / Comunidade", key=preparar_widget("localidade"), on_change=cb_sync_campo, args=("localidade",))
 
     aviso_cep = st.session_state.get("aviso_cep", "")
     if aviso_cep.startswith("ok:"):
@@ -1260,9 +1543,9 @@ with aba1:
         st.warning(aviso_cep[5:])
 
     e4, e5, e6 = st.columns([2, 2, 0.8])
-    e4.text_input("Bairro", key="bairro")
-    e5.text_input("Cidade", key="cidade")
-    e6.text_input("UF", key="uf", max_chars=2)
+    e4.text_input("Bairro", key=preparar_widget("bairro"), on_change=cb_sync_campo, args=("bairro",))
+    e5.text_input("Cidade", key=preparar_widget("cidade"), on_change=cb_sync_campo, args=("cidade",))
+    e6.text_input("UF", key=preparar_widget("uf"), max_chars=2, on_change=cb_sync_campo, args=("uf",))
 
     # Imóvel Beneficiado
     props_atuais = st.session_state.get("propriedades_lista", [])
@@ -1271,12 +1554,17 @@ with aba1:
         for p in props_atuais if p.get("nome")
     ]
     im1, im2 = st.columns([2, 1.5])
-    im1.text_input("Imóvel Beneficiado (Nome + Matrícula)", key="imovel_beneficiado_texto")
+    im1.text_input(
+        "Imóvel Beneficiado (Nome + Matrícula)",
+        key=preparar_widget("imovel_beneficiado_texto"),
+        on_change=cb_sync_campo,
+        args=("imovel_beneficiado_texto",),
+    )
     if opcoes_imov:
         im2.selectbox(
             "Ou selecionar imóvel salvo do cliente:",
             [""] + opcoes_imov,
-            key="seletor_imovel_salvo",
+            key="_w_seletor_imovel_salvo",
             on_change=cb_aplicar_imovel_salvo,
         )
 
@@ -1285,7 +1573,14 @@ with aba1:
 
     linhas_disponiveis = ["TODAS AS LINHAS"] + sorted({v["linha"] for v in catalogo_servicos.values()})
     fl1, fl2 = st.columns([1.2, 2.8])
-    linha_filtro = fl1.selectbox("Filtrar por Linha de Crédito", linhas_disponiveis, key="filtro_linha_credito")
+    fl1.selectbox(
+        "Filtrar por Linha de Crédito",
+        linhas_disponiveis,
+        key=preparar_widget_lista("filtro_linha_credito", linhas_disponiveis),
+        on_change=cb_sync_campo,
+        args=("filtro_linha_credito",),
+    )
+    linha_filtro = st.session_state["filtro_linha_credito"]
 
     if linha_filtro == "TODAS AS LINHAS":
         servicos_filtrados = [""] + list(catalogo_servicos.keys())
@@ -1293,13 +1588,14 @@ with aba1:
         servicos_filtrados = [""] + [k for k, v in catalogo_servicos.items() if v["linha"] == linha_filtro]
 
     if st.session_state["tipo_servico"] not in servicos_filtrados:
-        st.session_state["tipo_servico"] = ""
-        cb_ao_trocar_servico(catalogo_servicos)
+        definir_campo("tipo_servico", "")
+        definir_campo("descricao_servico", "")
+        definir_campo("item_financiado", "")
 
     fl2.selectbox(
         "Linha + Tipo de Serviço (preenche a descrição da Ordem de Serviço automaticamente)",
         servicos_filtrados,
-        key="tipo_servico",
+        key=preparar_widget_lista("tipo_servico", servicos_filtrados),
         on_change=cb_ao_trocar_servico,
         args=(catalogo_servicos,),
     )
@@ -1308,22 +1604,45 @@ with aba1:
     info_serv_atual = catalogo_servicos.get(st.session_state["tipo_servico"], {})
     itens_da_linha = list(info_serv_atual.get("itens", [])) if info_serv_atual else listas_cat["TODOS_ITENS"]
     opcoes_item = [""] + itens_da_linha + ["OUTRO ITEM (DIGITAR MANUALMENTE)"]
-    if st.session_state["item_financiado"] not in opcoes_item:
+    if st.session_state["item_financiado"] and st.session_state["item_financiado"] not in opcoes_item:
         opcoes_item.insert(1, st.session_state["item_financiado"])
 
-    op1.selectbox("Item Financiável desta Linha", opcoes_item, key="item_financiado")
+    op1.selectbox(
+        "Item Financiável desta Linha",
+        opcoes_item,
+        key=preparar_widget_lista("item_financiado", opcoes_item),
+        on_change=cb_sync_campo,
+        args=("item_financiado",),
+    )
     if st.session_state["item_financiado"] == "OUTRO ITEM (DIGITAR MANUALMENTE)":
-        op1.text_input("Digite o item financiado:", key="item_financiado_custom")
+        op1.text_input(
+            "Digite o item financiado:",
+            key=preparar_widget("item_financiado_custom"),
+            on_change=cb_sync_campo,
+            args=("item_financiado_custom",),
+        )
 
     lista_cult = [""] + listas_cat["CULTURA"]
-    if st.session_state["cultura"] not in lista_cult:
+    if st.session_state["cultura"] and st.session_state["cultura"] not in lista_cult:
         lista_cult.append(st.session_state["cultura"])
-    op2.selectbox("Cultura / Atividade Principal (Minas Gerais)", lista_cult, key="cultura")
+    op2.selectbox(
+        "Cultura / Atividade Principal (Minas Gerais)",
+        lista_cult,
+        key=preparar_widget_lista("cultura", lista_cult),
+        on_change=cb_sync_campo,
+        args=("cultura",),
+    )
 
     lista_car = [""] + listas_cat["CARENCIA"]
-    if st.session_state["carencia"] not in lista_car:
+    if st.session_state["carencia"] and st.session_state["carencia"] not in lista_car:
         lista_car.append(st.session_state["carencia"])
-    op3.selectbox("Carência", lista_car, key="carencia")
+    op3.selectbox(
+        "Carência",
+        lista_car,
+        key=preparar_widget_lista("carencia", lista_car),
+        on_change=cb_sync_campo,
+        args=("carencia",),
+    )
 
     op4, op5 = st.columns(2)
     op4.number_input(
@@ -1331,16 +1650,24 @@ with aba1:
         min_value=0.0,
         step=1000.0,
         format="%.2f",
-        key="valor_proposto",
+        key=preparar_widget("valor_proposto"),
+        on_change=cb_sync_campo,
+        args=("valor_proposto",),
         placeholder="",
     )
 
     nomes_cont = [""] + df_contabilidades["nome"].tolist()
     mapa_cnpj = dict(zip(df_contabilidades["nome"], df_contabilidades["cnpj"]))
-    if st.session_state["contabilidade_nome"] not in nomes_cont:
+    if st.session_state["contabilidade_nome"] and st.session_state["contabilidade_nome"] not in nomes_cont:
         nomes_cont.append(st.session_state["contabilidade_nome"])
-    cont_esc = op5.selectbox("Contabilidade do Produtor", nomes_cont, key="contabilidade_nome")
-    st.session_state["contabilidade_cnpj"] = fmt_doc(mapa_cnpj.get(cont_esc, ""))
+    op5.selectbox(
+        "Contabilidade do Produtor",
+        nomes_cont,
+        key=preparar_widget_lista("contabilidade_nome", nomes_cont),
+        on_change=cb_sync_campo,
+        args=("contabilidade_nome",),
+    )
+    st.session_state["contabilidade_cnpj"] = fmt_doc(mapa_cnpj.get(st.session_state["contabilidade_nome"], ""))
 
     # Checklist de Documentos
     st.markdown("#### ✅ Checklist de Documentos")
@@ -1350,34 +1677,63 @@ with aba1:
         st.caption("**PROPONENTE**")
         for doc_nome in DOCS_PROPONENTE:
             chave = f"prop_{doc_nome}"
-            chk[chave] = st.checkbox(doc_nome, value=bool(chk.get(chave, False)), key=f"ui_{chave}")
+            wk = f"_w_chk_{chave}"
+            if wk not in st.session_state:
+                st.session_state[wk] = bool(chk.get(chave, False))
+            chk[chave] = st.checkbox(doc_nome, key=wk)
     with ck2:
         st.caption("**IMÓVEL**")
         for doc_nome in DOCS_IMOVEL:
             chave = f"imov_{doc_nome}"
-            chk[chave] = st.checkbox(doc_nome, value=bool(chk.get(chave, False)), key=f"ui_{chave}")
+            wk = f"_w_chk_{chave}"
+            if wk not in st.session_state:
+                st.session_state[wk] = bool(chk.get(chave, False))
+            chk[chave] = st.checkbox(doc_nome, key=wk)
         lista_envio = [""] + listas_cat["TIPO_ENVIO"]
-        if st.session_state["tipo_envio_docs"] not in lista_envio:
+        if st.session_state["tipo_envio_docs"] and st.session_state["tipo_envio_docs"] not in lista_envio:
             lista_envio.append(st.session_state["tipo_envio_docs"])
-        st.selectbox("Tipo de Envio dos Documentos", lista_envio, key="tipo_envio_docs")
-        st.text_input("Data de Envio dos Docs", key="data_envio_docs", placeholder="")
+        st.selectbox(
+            "Tipo de Envio dos Documentos",
+            lista_envio,
+            key=preparar_widget_lista("tipo_envio_docs", lista_envio),
+            on_change=cb_sync_campo,
+            args=("tipo_envio_docs",),
+        )
+        st.text_input(
+            "Data de Envio dos Docs",
+            key=preparar_widget("data_envio_docs"),
+            on_change=cb_sync_campo,
+            args=("data_envio_docs",),
+            placeholder="",
+        )
     with ck3:
         st.caption("**COOBRIGADOS**")
         for doc_nome in DOCS_COOBRIGADOS:
             chave = f"coob_{doc_nome}"
-            chk[chave] = st.checkbox(doc_nome, value=bool(chk.get(chave, False)), key=f"ui_{chave}")
+            wk = f"_w_chk_{chave}"
+            if wk not in st.session_state:
+                st.session_state[wk] = bool(chk.get(chave, False))
+            chk[chave] = st.checkbox(doc_nome, key=wk)
     st.session_state["checklist_docs"] = chk
 
-    # MARGEM CRÉDITO PESSOAL E AVALISTAS SEPARADOS (CAMPOS VAZIOS EM BRANCO!)
+    # MARGEM CRÉDITO PESSOAL E AVALISTAS SEPARADOS
     st.divider()
     col_margem, col_aval = st.columns(2)
 
     with col_margem:
         st.markdown("#### 💳 Margem Crédito Pessoal e Consórcio")
+        wk_mods = "_w_credito_modalidades"
+        if wk_mods not in st.session_state:
+            st.session_state[wk_mods] = [
+                m for m in (st.session_state.get("credito_modalidades") or [])
+                if m in TIPOS_CREDITO_PESSOAL_PADRAO
+            ]
         st.multiselect(
             "Modalidade (marca com X no PDF — deixe vazio para marcar à mão na impressão)",
             options=TIPOS_CREDITO_PESSOAL_PADRAO,
-            key="credito_modalidades",
+            key=wk_mods,
+            on_change=cb_sync_campo,
+            args=("credito_modalidades",),
             placeholder="Selecione se desejar marcar automaticamente no PDF",
         )
         st.number_input(
@@ -1385,7 +1741,9 @@ with aba1:
             min_value=0.0,
             step=100.0,
             format="%.2f",
-            key="credito_valor",
+            key=preparar_widget("credito_valor"),
+            on_change=cb_sync_campo,
+            args=("credito_valor",),
             placeholder="",
         )
         st.caption("**Consórcio:**")
@@ -1395,32 +1753,36 @@ with aba1:
             min_value=0.0,
             step=50.0,
             format="%.2f",
-            key="parcela_consorcio",
+            key=preparar_widget("parcela_consorcio"),
+            on_change=cb_sync_campo,
+            args=("parcela_consorcio",),
             placeholder="",
         )
         m4.number_input(
             "Quantidade de Parcelas do Consórcio",
             min_value=0,
             step=1,
-            key="num_parcelas_consorcio",
+            key=preparar_widget("num_parcelas_consorcio"),
+            on_change=cb_sync_campo,
+            args=("num_parcelas_consorcio",),
             placeholder="",
         )
 
     with col_aval:
         st.markdown("#### 🤝 Avalistas (Avalista e Cônjuge)")
-        st.text_input("Nome Completo do Avalista", key="avalista_nome")
+        st.text_input("Nome Completo do Avalista", key=preparar_widget("avalista_nome"), on_change=cb_sync_campo, args=("avalista_nome",))
         st.text_input(
             "CPF/CNPJ do Avalista",
-            key="avalista_cpf",
-            on_change=cb_formatar_doc,
-            args=("avalista_cpf",),
+            key=preparar_widget("avalista_cpf"),
+            on_change=cb_sync_campo,
+            args=("avalista_cpf", True),
         )
-        st.text_input("Nome Completo do Cônjuge do Avalista", key="conjuge_avalista_nome")
+        st.text_input("Nome Completo do Cônjuge do Avalista", key=preparar_widget("conjuge_avalista_nome"), on_change=cb_sync_campo, args=("conjuge_avalista_nome",))
         st.text_input(
             "CPF do Cônjuge do Avalista",
-            key="conjuge_avalista_cpf",
-            on_change=cb_formatar_doc,
-            args=("conjuge_avalista_cpf",),
+            key=preparar_widget("conjuge_avalista_cpf"),
+            on_change=cb_sync_campo,
+            args=("conjuge_avalista_cpf", True),
         )
 
     # PARECER DA AGÊNCIA BANCÁRIA
@@ -1428,73 +1790,98 @@ with aba1:
     st.markdown("#### 🏦 Parecer da Agência Bancária")
     st.text_area(
         "Observações / Parecer da Agência (opcional — deixe em branco para preencher à mão no documento impresso):",
-        key="parecer_agencia",
+        key=preparar_widget("parecer_agencia"),
+        on_change=cb_sync_campo,
+        args=("parecer_agencia",),
         height=75,
     )
 
 
 # ----------------------------------------------------------------------------
-# ABA 2: ANÁLISE PRODUTIVA (CAMPOS VAZIOS 100% EM BRANCO)
+# ABA 2: ANÁLISE PRODUTIVA (COM R$ 0,00 E LINHA INTEIRA PARA NOME DA PROPRIEDADE)
 # ----------------------------------------------------------------------------
-with aba2:
+elif aba_ativa == "🌱 2. Análise Produtiva":
     st.subheader("🌱 Análise Produtiva e Propriedades do Produtor")
-    st.caption("A primeira propriedade representa o Imóvel Beneficiado. Deixe em branco os campos que não se aplicam.")
+    st.caption("A primeira propriedade representa o Imóvel Beneficiado. Os valores de venda e rendas extras são somados automaticamente ao final.")
 
     props = st.session_state["propriedades_lista"]
     col_add, col_rem = st.columns([1, 1])
     if col_add.button("➕ Adicionar Outra Propriedade"):
+        sincronizar_widgets_para_estado()
         props.append(_propriedade_vazia())
         st.rerun()
     if len(props) > 1 and col_rem.button("➖ Remover Última Propriedade"):
+        sincronizar_widgets_para_estado()
         props.pop()
+        limpar_chaves_widgets()
         st.rerun()
 
     for idx, p in enumerate(props):
         titulo_box = "🏡 Propriedade 1 (Beneficiada)" if idx == 0 else f"🏡 Propriedade {idx + 1}"
         nome_exib = f" — {p.get('nome')}" if p.get("nome") else ""
         with st.expander(f"{titulo_box}{nome_exib}", expanded=(idx == 0)):
+            def _pw(pref, campo_p, default_val=""):
+                wk = f"_w_p_{pref}_{idx}"
+                if wk not in st.session_state:
+                    st.session_state[wk] = p.get(campo_p, default_val)
+                return wk
+
             # Linha inteira dedicada ao Nome da Propriedade
-            p["nome"] = st.text_input("Nome da Propriedade", value=p.get("nome", ""), key=f"p_nome_{idx}")
+            p["nome"] = st.text_input("Nome da Propriedade", key=_pw("nome", "nome", ""))
             r1c1, r1c2, r1c3 = st.columns(3)
-            p["matricula"] = r1c1.text_input("Matrícula", value=p.get("matricula", ""), key=f"p_mat_{idx}")
-            p["num_pes"] = r1c2.number_input("Nº Pés de Café", min_value=0, step=100, value=num_int_ou_none(p.get("num_pes")), key=f"p_pes_{idx}", placeholder="")
-            p["espacamento"] = r1c3.text_input("Espaçamento", value=p.get("espacamento", ""), key=f"p_esp_{idx}")
+            p["matricula"] = r1c1.text_input("Matrícula", key=_pw("mat", "matricula", ""))
+            if f"_w_p_pes_{idx}" not in st.session_state:
+                st.session_state[f"_w_p_pes_{idx}"] = num_int_ou_none(p.get("num_pes"))
+            p["num_pes"] = r1c2.number_input("Nº Pés de Café", min_value=0, step=100, key=f"_w_p_pes_{idx}", placeholder="")
+            p["espacamento"] = r1c3.text_input("Espaçamento", key=_pw("esp", "espacamento", ""))
 
             r2c1, r2c2, r2c3 = st.columns(3)
-            p["variedades"] = r2c1.text_input("Variedades", value=p.get("variedades", ""), key=f"p_var_{idx}")
-            p["idade"] = r2c2.text_input("Idade da Lavoura", value=p.get("idade", ""), key=f"p_id_{idx}")
-            p["prev_2027"] = r2c3.text_input("Previsão Safra 2027", value=p.get("prev_2027", ""), key=f"p_pr27_{idx}")
+            p["variedades"] = r2c1.text_input("Variedades", key=_pw("var", "variedades", ""))
+            p["idade"] = r2c2.text_input("Idade da Lavoura", key=_pw("id", "idade", ""))
+            p["prev_2027"] = r2c3.text_input("Previsão Safra 2027", key=_pw("pr27", "prev_2027", ""))
 
             r3c1, r3c2, r3c3 = st.columns(3)
-            p["prod_2026"] = r3c1.text_input("Produção 2026", value=p.get("prod_2026", ""), key=f"p_p26_{idx}")
-            p["prod_2025"] = r3c2.text_input("Produção 2025", value=p.get("prod_2025", ""), key=f"p_p25_{idx}")
-            p["prod_2024"] = r3c3.text_input("Produção 2024", value=p.get("prod_2024", ""), key=f"p_p24_{idx}")
+            p["prod_2026"] = r3c1.text_input("Produção 2026", key=_pw("p26", "prod_2026", ""))
+            p["prod_2025"] = r3c2.text_input("Produção 2025", key=_pw("p25", "prod_2025", ""))
+            p["prod_2024"] = r3c3.text_input("Produção 2024", key=_pw("p24", "prod_2024", ""))
 
             r4c1, r4c2, r4c3 = st.columns(3)
-            p["venda_2026"] = r4c1.number_input("Valor de Venda 2026 (R$)", min_value=0.0, step=500.0, value=float(p.get("venda_2026") or 0.0), key=f"p_v26_{idx}", format="%.2f")
-            p["venda_2025"] = r4c2.number_input("Valor de Venda 2025 (R$)", min_value=0.0, step=500.0, value=float(p.get("venda_2025") or 0.0), key=f"p_v25_{idx}", format="%.2f")
-            p["venda_2024"] = r4c3.number_input("Valor de Venda 2024 (R$)", min_value=0.0, step=500.0, value=float(p.get("venda_2024") or 0.0), key=f"p_v24_{idx}", format="%.2f")
+            for pref_v, campo_v in [("v26", "venda_2026"), ("v25", "venda_2025"), ("v24", "venda_2024")]:
+                wk_v = f"_w_p_{pref_v}_{idx}"
+                if wk_v not in st.session_state:
+                    st.session_state[wk_v] = float(p.get(campo_v) or 0.0)
+            p["venda_2026"] = r4c1.number_input("Valor de Venda 2026 (R$)", min_value=0.0, step=500.0, key=f"_w_p_v26_{idx}", format="%.2f")
+            p["venda_2025"] = r4c2.number_input("Valor de Venda 2025 (R$)", min_value=0.0, step=500.0, key=f"_w_p_v25_{idx}", format="%.2f")
+            p["venda_2024"] = r4c3.number_input("Valor de Venda 2024 (R$)", min_value=0.0, step=500.0, key=f"_w_p_v24_{idx}", format="%.2f")
 
     st.divider()
     st.markdown("#### 🐄 Semoventes, Renda Extra e Bens")
     sem = st.session_state["semoventes"]
+    for campo_si in ("vacas_leite", "boi_corte", "novilhas", "bezerros"):
+        if f"_w_sem_{campo_si}" not in st.session_state:
+            st.session_state[f"_w_sem_{campo_si}"] = num_int_ou_none(sem.get(campo_si))
+    if "_w_sem_litros_dia" not in st.session_state:
+        st.session_state["_w_sem_litros_dia"] = num_float_ou_none(sem.get("litros_dia"))
+    if "_w_sem_preco_litro" not in st.session_state:
+        st.session_state["_w_sem_preco_litro"] = float(sem.get("preco_litro") or 0.0)
+
     s1, s2, s3 = st.columns(3)
-    sem["vacas_leite"] = s1.number_input("Vacas de Leite (qtd)", min_value=0, step=1, value=num_int_ou_none(sem.get("vacas_leite")), placeholder="")
-    sem["litros_dia"] = s2.number_input("Litros por Dia", min_value=0.0, step=5.0, value=num_float_ou_none(sem.get("litros_dia")), placeholder="")
-    sem["preco_litro"] = s3.number_input("Preço por Litro (R$)", min_value=0.0, step=0.10, value=float(sem.get("preco_litro") or 0.0), format="%.2f")
+    sem["vacas_leite"] = s1.number_input("Vacas de Leite (qtd)", min_value=0, step=1, key="_w_sem_vacas_leite", placeholder="")
+    sem["litros_dia"] = s2.number_input("Litros por Dia", min_value=0.0, step=5.0, key="_w_sem_litros_dia", placeholder="")
+    sem["preco_litro"] = s3.number_input("Preço por Litro (R$)", min_value=0.0, step=0.10, key="_w_sem_preco_litro", format="%.2f")
 
     s4, s5, s6 = st.columns(3)
-    sem["boi_corte"] = s4.number_input("Boi de Corte (qtd)", min_value=0, step=1, value=num_int_ou_none(sem.get("boi_corte")), placeholder="")
-    sem["novilhas"] = s5.number_input("Novilhas (qtd)", min_value=0, step=1, value=num_int_ou_none(sem.get("novilhas")), placeholder="")
-    sem["bezerros"] = s6.number_input("Bezerros (qtd)", min_value=0, step=1, value=num_int_ou_none(sem.get("bezerros")), placeholder="")
+    sem["boi_corte"] = s4.number_input("Boi de Corte (qtd)", min_value=0, step=1, key="_w_sem_boi_corte", placeholder="")
+    sem["novilhas"] = s5.number_input("Novilhas (qtd)", min_value=0, step=1, key="_w_sem_novilhas", placeholder="")
+    sem["bezerros"] = s6.number_input("Bezerros (qtd)", min_value=0, step=1, key="_w_sem_bezerros", placeholder="")
 
     re1, re2, re3, re4 = st.columns([2, 1, 2, 1])
-    re1.text_input("Renda Extra 1 (Descrição)", key="renda_extra_1_desc")
-    re2.number_input("Valor Renda 1 (R$)", min_value=0.0, step=500.0, format="%.2f", key="renda_extra_1_val")
-    re3.text_input("Renda Extra 2 (Descrição)", key="renda_extra_2_desc")
-    re4.number_input("Valor Renda 2 (R$)", min_value=0.0, step=500.0, format="%.2f", key="renda_extra_2_val")
+    re1.text_input("Renda Extra 1 (Descrição)", key=preparar_widget("renda_extra_1_desc"), on_change=cb_sync_campo, args=("renda_extra_1_desc",))
+    re2.number_input("Valor Renda 1 (R$)", min_value=0.0, step=500.0, format="%.2f", key=preparar_widget("renda_extra_1_val"), on_change=cb_sync_campo, args=("renda_extra_1_val",))
+    re3.text_input("Renda Extra 2 (Descrição)", key=preparar_widget("renda_extra_2_desc"), on_change=cb_sync_campo, args=("renda_extra_2_desc",))
+    re4.number_input("Valor Renda 2 (R$)", min_value=0.0, step=500.0, format="%.2f", key=preparar_widget("renda_extra_2_val"), on_change=cb_sync_campo, args=("renda_extra_2_val",))
 
-    st.text_area("Relação de Bens (máquinas, veículos, benfeitorias)", key="bens", height=80)
+    st.text_area("Relação de Bens (máquinas, veículos, benfeitorias)", key=preparar_widget("bens"), on_change=cb_sync_campo, args=("bens",), height=80)
 
     resumo_prod = montar_dicionario_proposta()
     with st.container(border=True):
@@ -1506,9 +1893,9 @@ with aba2:
 
 
 # ----------------------------------------------------------------------------
-# ABA 3: ORDEM DE SERVIÇO & LGPD (SEM GOV.BR + COOPERATIVAS DE CRÉDITO)
+# ABA 3: ORDEM DE SERVIÇO & LGPD
 # ----------------------------------------------------------------------------
-with aba3:
+elif aba_ativa == "🧾 3. Ordem de Serviço & LGPD":
     st.subheader("🧾 Ordem de Serviço")
     st.caption(
         "Configure abaixo a faixa de honorários, eventuais descontos ou acréscimos e a forma de pagamento. "
@@ -1517,14 +1904,16 @@ with aba3:
 
     st.text_area(
         "Descrição do Serviço (preenchida automaticamente pela Linha + Serviço escolhidos na Aba 1):",
-        key="descricao_servico",
+        key=preparar_widget("descricao_servico"),
+        on_change=cb_sync_campo,
+        args=("descricao_servico",),
         height=95,
     )
 
     liberado_desconto = pode_dar_desconto_os()
     if not liberado_desconto:
-        st.session_state["faixa_honorario_idx"] = 2
-        st.session_state["desconto_extra"] = None
+        definir_campo("faixa_honorario_idx", 2)
+        definir_campo("desconto_extra", None)
 
     os1, os2, os3 = st.columns([2.2, 1.1, 1.1])
     opcoes_faixa_chaves = list(FAIXAS_HONORARIOS.keys())
@@ -1532,7 +1921,9 @@ with aba3:
         "Faixa de Honorários (Define a porcentagem de desconto)",
         options=opcoes_faixa_chaves,
         format_func=lambda k: FAIXAS_HONORARIOS[k]["rotulo"],
-        key="faixa_honorario_idx",
+        key=preparar_widget_lista("faixa_honorario_idx", opcoes_faixa_chaves),
+        on_change=cb_sync_campo,
+        args=("faixa_honorario_idx",),
         disabled=not liberado_desconto,
     )
     os2.number_input(
@@ -1540,11 +1931,22 @@ with aba3:
         min_value=0.0,
         step=100.0,
         format="%.2f",
-        key="desconto_extra",
+        key=preparar_widget("desconto_extra"),
+        on_change=cb_sync_campo,
+        args=("desconto_extra",),
         placeholder="",
         disabled=not liberado_desconto,
     )
-    os3.number_input("Acréscimos (R$)", min_value=0.0, step=100.0, format="%.2f", key="acrescimos", placeholder="")
+    os3.number_input(
+        "Acréscimos (R$)",
+        min_value=0.0,
+        step=100.0,
+        format="%.2f",
+        key=preparar_widget("acrescimos"),
+        on_change=cb_sync_campo,
+        args=("acrescimos",),
+        placeholder="",
+    )
 
     if not tem_permissao("aplicar_desconto_os"):
         if st.session_state.get("desconto_liberado_por_admin"):
@@ -1561,9 +1963,9 @@ with aba3:
                         else:
                             st.error("❌ Senha do Administrador inválida.")
 
-    st.text_input("Forma de Pagamento", key="forma_pagamento")
+    st.text_input("Forma de Pagamento", key=preparar_widget("forma_pagamento"), on_change=cb_sync_campo, args=("forma_pagamento",))
 
-    # Painel financeiro espaçoso e bem organizado (sem cortar números!)
+    # Painel financeiro espaçoso e bem organizado
     d_calc = montar_dicionario_proposta()
     val_prop_c = float(d_calc["valor_proposto"] or 0.0)
     desc_tot_c = float(d_calc["desconto"] or 0.0)
@@ -1610,7 +2012,7 @@ with aba3:
 
     if tem_permissao("criar_editar_proposta"):
         if st.button("💾 Salvar Proposta e Atualizar Cadastro no Banco", type="primary", use_container_width=True):
-            pid = salvar_tudo_no_banco()
+            pid = salvar_tudo_no_banco(silencioso=False)
             if pid:
                 st.success(f"✅ Proposta #{pid} salva com sucesso no PostgreSQL! Agora você pode gerar os PDFs na Aba 4.")
     else:
@@ -1620,16 +2022,14 @@ with aba3:
 # ----------------------------------------------------------------------------
 # ABA 4: IMPRESSÃO / PDFs (P&B, MARGENS CONFORTÁVEIS, 1 FOLHA A4, MARCA D'ÁGUA)
 # ----------------------------------------------------------------------------
-with aba4:
+elif aba_ativa == "🖨️ 4. Imprimir / PDFs (P&B)":
     st.subheader("🖨️ Impressão de Pacotes Bancários e Documentos Avulsos")
     if not tem_permissao("gerar_pdf"):
         st.warning("🔒 Seu usuário não tem autorização para gerar/imprimir PDFs. Solicite liberação ao Administrador.")
     else:
-
         st.info(
             "🖨️ **Padrão de Impressão Ativado:** Preto e Branco • Margens confortáveis (1,4 cm × 1,3 cm) • "
-            "Distribuição equilibrada em 1 folha A4 por documento • Campos vazios em branco • "
-            "Marca d'água oficial da Regularize em todas as folhas."
+            "Distribuição equilibrada em 1 folha A4 por documento • Marca d'água oficial da Regularize em todas as folhas."
         )
 
         d_pdf = montar_dicionario_proposta()
@@ -1682,11 +2082,10 @@ with aba4:
             )
 
 
-
 # ----------------------------------------------------------------------------
 # ABA 5: HISTÓRICO EM PT-BR & CADASTRO DE CONTABILIDADES
 # ----------------------------------------------------------------------------
-with aba5:
+elif aba_ativa == "🗂️ 5. Histórico & Cadastros":
     st.subheader("🗂️ Histórico de Propostas Salvas")
     f1, f2, f3 = st.columns([2, 1.5, 1])
     busca_hist = f1.text_input("Filtrar por Nome ou CPF/CNPJ:", placeholder="")
@@ -1811,265 +2210,281 @@ with aba5:
 
 
 # ----------------------------------------------------------------------------
-# ABA 6: PAINEL DO ADMINISTRADOR (USUÁRIOS E TIPOS DE AUTORIZAÇÕES POR SENHA)
+# ABA 6: PAINEL DO ADMINISTRADOR (ADMIN MASTER, USUÁRIOS E AUTORIZAÇÕES)
 # ----------------------------------------------------------------------------
-if aba6_admin is not None:
-    with aba6_admin:
-        st.subheader("🔐 Administração de Usuários e Autorizações")
-        st.info(
-            "🛡️ **Segurança reforçada:** Apenas o Administrador visualiza esta aba. "
-            "Para cadastrar novos usuários, alterar autorizações, redefinir senhas ou desativar acessos, "
-            "é obrigatório confirmar com a **Senha do Administrador**."
+elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
+    st.subheader("🔐 Administração de Usuários e Autorizações")
+    st.info(
+        "🛡️ **Segurança reforçada:** Apenas Administradores visualizam esta aba. "
+        "Contas **Admin Master** (`regularizeassessoriarural@gmail.com` e `regularizesulmg@gmail.com`) "
+        "possuem proteção permanente. Para adicionar usuários, alterar autorizações ou redefinir senhas, "
+        "é obrigatório confirmar com a **Senha do Administrador**."
+    )
+
+    with engine.connect() as conn:
+        df_users = pd.read_sql(
+            text("""
+                SELECT email, nome, perfil, ativo, permissoes, criado_por, criado_em, atualizado_em
+                FROM usuarios_sistema
+                ORDER BY ativo DESC, perfil, email
+            """),
+            conn,
         )
 
-        # Carregar todos os usuários cadastrados no banco
-        with engine.connect() as conn:
-            df_users = pd.read_sql(
-                text("""
-                    SELECT email, nome, perfil, ativo, permissoes, criado_por, criado_em, atualizado_em
-                    FROM usuarios_sistema
-                    ORDER BY ativo DESC, perfil, email
-                """),
-                conn,
+    st.markdown("#### 👥 Usuários Cadastrados e Suas Autorizações")
+    if not df_users.empty:
+        linhas_u = []
+        for _, ru in df_users.iterrows():
+            eh_m = eh_admin_master(ru["email"])
+            p_dict = ru["permissoes"] if isinstance(ru["permissoes"], dict) else {}
+            perms_ativas = [
+                k.replace("_", " ").title()
+                for k in PERMISSOES_DESCRICAO.keys()
+                if (eh_m or ru["perfil"] == "ADMIN" or p_dict.get(k, False))
+            ]
+            rotulo_perf = "👑 ADMIN MASTER" if eh_m else ru["perfil"]
+            linhas_u.append({
+                "E-mail": ru["email"],
+                "Nome": ru["nome"] or "",
+                "Perfil": rotulo_perf,
+                "Status": "✅ Ativo" if (eh_m or ru["ativo"]) else "⛔ Desativado",
+                "Autorizações Liberadas": ", ".join(perms_ativas) if perms_ativas else "Nenhuma",
+                "Criado por": ru["criado_por"] or "",
+            })
+        st.dataframe(pd.DataFrame(linhas_u), use_container_width=True, hide_index=True)
+    else:
+        st.info("Nenhum usuário cadastrado na tabela ainda.")
+
+    st.divider()
+    col_add_u, col_edit_u = st.columns(2)
+
+    # ========================================================================
+    # BLOCO A: ADICIONAR NOVO USUÁRIO (SOMENTE ADMIN COM SENHA)
+    # ========================================================================
+    with col_add_u:
+        st.markdown("### ➕ Adicionar Novo Usuário")
+        perfil_novo = st.selectbox(
+            "Perfil de Autorização do Novo Usuário",
+            options=list(PERFIS_AUTORIZACAO.keys()),
+            format_func=lambda k: f"{k} — {PERFIS_AUTORIZACAO[k]['rotulo']}",
+            index=list(PERFIS_AUTORIZACAO.keys()).index("ATENDENTE"),
+            key="adm_novo_perfil",
+        )
+        perms_modelo_novo = dict(PERFIS_AUTORIZACAO[perfil_novo]["permissoes"])
+
+        with st.form("form_adm_add_usuario", clear_on_submit=True):
+            novo_nome_u = st.text_input("Nome completo do usuário *")
+            novo_email_u = st.text_input("E-mail de acesso *").strip().lower()
+            nova_senha_u = st.text_input("Senha inicial do usuário *", type="password")
+            nova_senha_u2 = st.text_input("Confirmar senha inicial *", type="password")
+
+            st.markdown("**Autorizações que serão liberadas para este usuário:**")
+            perms_escolhidas_novo = {}
+            for chave_p, desc_p in PERMISSOES_DESCRICAO.items():
+                val_def = bool(perms_modelo_novo.get(chave_p, False))
+                if perfil_novo == "ADMIN":
+                    st.checkbox(desc_p, value=True, disabled=True, key=f"adm_new_p_{perfil_novo}_{chave_p}")
+                    perms_escolhidas_novo[chave_p] = True
+                else:
+                    perms_escolhidas_novo[chave_p] = st.checkbox(
+                        desc_p,
+                        value=val_def,
+                        key=f"adm_new_p_{perfil_novo}_{chave_p}",
+                    )
+
+            st.divider()
+            senha_admin_add = st.text_input(
+                "🔑 Senha do Administrador (obrigatória para liberar cadastro) *",
+                type="password",
             )
+            btn_criar_u = st.form_submit_button("✅ Criar Usuário e Liberar Autorizações", type="primary", use_container_width=True)
 
-        st.markdown("#### 👥 Usuários Cadastrados e Suas Autorizações")
-        if not df_users.empty:
-            linhas_u = []
-            for _, ru in df_users.iterrows():
-                p_dict = ru["permissoes"] if isinstance(ru["permissoes"], dict) else {}
-                perms_ativas = [
-                    k.replace("_", " ").title()
-                    for k in PERMISSOES_DESCRICAO.keys()
-                    if (ru["perfil"] == "ADMIN" or p_dict.get(k, False))
-                ]
-                linhas_u.append({
-                    "E-mail": ru["email"],
-                    "Nome": ru["nome"] or "",
-                    "Perfil": ru["perfil"],
-                    "Status": "✅ Ativo" if ru["ativo"] else "⛔ Desativado",
-                    "Autorizações Liberadas": ", ".join(perms_ativas) if perms_ativas else "Nenhuma",
-                    "Criado por": ru["criado_por"] or "",
-                })
-            st.dataframe(pd.DataFrame(linhas_u), use_container_width=True, hide_index=True)
-        else:
-            st.info("Nenhum usuário cadastrado na tabela ainda.")
-
-        st.divider()
-        col_add_u, col_edit_u = st.columns(2)
-
-        # ====================================================================
-        # BLOCO A: ADICIONAR NOVO USUÁRIO (SOMENTE ADMIN COM SENHA)
-        # ====================================================================
-        with col_add_u:
-            st.markdown("### ➕ Adicionar Novo Usuário")
-            perfil_novo = st.selectbox(
-                "Perfil de Autorização do Novo Usuário",
-                options=list(PERFIS_AUTORIZACAO.keys()),
-                format_func=lambda k: f"{k} — {PERFIS_AUTORIZACAO[k]['rotulo']}",
-                index=list(PERFIS_AUTORIZACAO.keys()).index("ATENDENTE"),
-                key="adm_novo_perfil",
-            )
-            perms_modelo_novo = dict(PERFIS_AUTORIZACAO[perfil_novo]["permissoes"])
-
-            with st.form("form_adm_add_usuario", clear_on_submit=True):
-                novo_nome_u = st.text_input("Nome completo do usuário *")
-                novo_email_u = st.text_input("E-mail de acesso *").strip().lower()
-                nova_senha_u = st.text_input("Senha inicial do usuário *", type="password")
-                nova_senha_u2 = st.text_input("Confirmar senha inicial *", type="password")
-
-                st.markdown("**Autorizações que serão liberadas para este usuário:**")
-                perms_escolhidas_novo = {}
-                for chave_p, desc_p in PERMISSOES_DESCRICAO.items():
-                    val_def = bool(perms_modelo_novo.get(chave_p, False))
+            if btn_criar_u:
+                if not validar_senha_admin(senha_admin_add):
+                    st.error("❌ Senha do Administrador incorreta! Operação bloqueada.")
+                elif not novo_nome_u.strip() or not novo_email_u or "@" not in novo_email_u:
+                    st.error("❌ Informe um Nome e um E-mail válido.")
+                elif len(nova_senha_u) < 4:
+                    st.error("❌ A senha inicial do usuário deve ter pelo menos 4 caracteres.")
+                elif nova_senha_u != nova_senha_u2:
+                    st.error("❌ A confirmação da senha inicial não confere.")
+                else:
                     if perfil_novo == "ADMIN":
-                        st.checkbox(desc_p, value=True, disabled=True, key=f"adm_new_p_{perfil_novo}_{chave_p}")
-                        perms_escolhidas_novo[chave_p] = True
+                        perms_finais = {k: True for k in PERMISSOES_DESCRICAO}
                     else:
-                        perms_escolhidas_novo[chave_p] = st.checkbox(
-                            desc_p,
-                            value=val_def,
-                            key=f"adm_new_p_{perfil_novo}_{chave_p}",
-                        )
-
-                st.divider()
-                senha_admin_add = st.text_input(
-                    "🔑 Senha do Administrador (obrigatória para liberar cadastro) *",
-                    type="password",
-                )
-                btn_criar_u = st.form_submit_button("✅ Criar Usuário e Liberar Autorizações", type="primary", use_container_width=True)
-
-                if btn_criar_u:
-                    if not validar_senha_admin(senha_admin_add):
-                        st.error("❌ Senha do Administrador incorreta! Operação bloqueada.")
-                    elif not novo_nome_u.strip() or not novo_email_u or "@" not in novo_email_u:
-                        st.error("❌ Informe um Nome e um E-mail válido.")
-                    elif len(nova_senha_u) < 4:
-                        st.error("❌ A senha inicial do usuário deve ter pelo menos 4 caracteres.")
-                    elif nova_senha_u != nova_senha_u2:
-                        st.error("❌ A confirmação da senha inicial não confere.")
-                    else:
-                        if perfil_novo == "ADMIN":
-                            perms_finais = {k: True for k in PERMISSOES_DESCRICAO}
+                        perms_finais = perms_escolhidas_novo
+                    with engine.begin() as conn:
+                        ja_existe = conn.execute(
+                            text("SELECT 1 FROM usuarios_sistema WHERE LOWER(email) = :e"),
+                            {"e": novo_email_u},
+                        ).first()
+                        if ja_existe:
+                            st.error(f"❌ Já existe um usuário cadastrado com o e-mail '{novo_email_u}'. Use o painel ao lado para editá-lo.")
                         else:
-                            perms_finais = perms_escolhidas_novo
-                        with engine.begin() as conn:
-                            ja_existe = conn.execute(
-                                text("SELECT 1 FROM usuarios_sistema WHERE LOWER(email) = :e"),
-                                {"e": novo_email_u},
-                            ).first()
-                            if ja_existe:
-                                st.error(f"❌ Já existe um usuário cadastrado com o e-mail '{novo_email_u}'. Use o painel ao lado para editá-lo.")
-                            else:
-                                conn.execute(
-                                    text("""
-                                        INSERT INTO usuarios_sistema (
-                                            email, nome, senha_hash, perfil, ativo, permissoes, criado_por
-                                        ) VALUES (
-                                            :e, :n, :sh, :perf, TRUE, CAST(:perms AS jsonb), :cp
-                                        )
-                                    """),
-                                    {
-                                        "e": novo_email_u,
-                                        "n": novo_nome_u.strip(),
-                                        "sh": gerar_hash_senha(nova_senha_u),
-                                        "perf": perfil_novo,
-                                        "perms": json.dumps(perms_finais, ensure_ascii=False),
-                                        "cp": usuario_atual,
-                                    },
-                                )
-                                st.success(f"✅ Usuário '{novo_nome_u.strip()}' ({novo_email_u}) criado com sucesso!")
-                                st.rerun()
+                            conn.execute(
+                                text("""
+                                    INSERT INTO usuarios_sistema (
+                                        email, nome, senha_hash, perfil, ativo, permissoes, criado_por
+                                    ) VALUES (
+                                        :e, :n, :sh, :perf, TRUE, CAST(:perms AS jsonb), :cp
+                                    )
+                                """),
+                                {
+                                    "e": novo_email_u,
+                                    "n": novo_nome_u.strip(),
+                                    "sh": gerar_hash_senha(nova_senha_u),
+                                    "perf": perfil_novo,
+                                    "perms": json.dumps(perms_finais, ensure_ascii=False),
+                                    "cp": usuario_atual,
+                                },
+                            )
+                            st.success(f"✅ Usuário '{novo_nome_u.strip()}' ({novo_email_u}) criado com sucesso!")
+                            st.rerun()
 
-        # ====================================================================
-        # BLOCO B: LIBERAR/EDITAR AUTORIZAÇÕES, SENHA OU STATUS DE USUÁRIO
-        # ====================================================================
-        with col_edit_u:
-            st.markdown("### 🛡️ Gerenciar Autorizações e Senha de Usuário")
-            if df_users.empty:
-                st.caption("Cadastre o primeiro usuário ao lado.")
-            else:
-                lista_emails_u = df_users["email"].tolist()
-                email_sel = st.selectbox("Selecione o usuário para configurar:", lista_emails_u, key="adm_edit_sel")
-                u_edit = carregar_usuario_db(email_sel)
+    # ========================================================================
+    # BLOCO B: LIBERAR/EDITAR AUTORIZAÇÕES, SENHA OU STATUS DE USUÁRIO
+    # ========================================================================
+    with col_edit_u:
+        st.markdown("### 🛡️ Gerenciar Autorizações e Senha de Usuário")
+        if df_users.empty:
+            st.caption("Cadastre o primeiro usuário ao lado.")
+        else:
+            lista_emails_u = df_users["email"].tolist()
+            email_sel = st.selectbox("Selecione o usuário para configurar:", lista_emails_u, key="adm_edit_sel")
+            u_edit = carregar_usuario_db(email_sel)
 
-                if u_edit:
-                    op_perfis = list(PERFIS_AUTORIZACAO.keys())
-                    idx_p_u = op_perfis.index(u_edit["perfil"]) if u_edit["perfil"] in op_perfis else op_perfis.index("PERSONALIZADO")
-                    perfil_edit = st.selectbox(
-                        "Alterar Perfil Base (atualiza as sugestões abaixo):",
-                        options=op_perfis,
-                        index=idx_p_u,
-                        format_func=lambda k: f"{k} — {PERFIS_AUTORIZACAO[k]['rotulo']}",
-                        key=f"adm_edit_perf_{email_sel}",
+            if u_edit:
+                eh_sel_master = u_edit["eh_master"]
+                if eh_sel_master:
+                    st.info("👑 **Conta ADMIN MASTER:** protegida contra desativação, exclusão ou remoção de permissões. Você pode alterar o nome ou redefinir a senha abaixo.")
+
+                op_perfis = list(PERFIS_AUTORIZACAO.keys())
+                idx_p_u = op_perfis.index(u_edit["perfil"]) if u_edit["perfil"] in op_perfis else op_perfis.index("PERSONALIZADO")
+                perfil_edit = st.selectbox(
+                    "Alterar Perfil Base (atualiza as sugestões abaixo):",
+                    options=op_perfis,
+                    index=idx_p_u,
+                    format_func=lambda k: f"{k} — {PERFIS_AUTORIZACAO[k]['rotulo']}",
+                    key=f"adm_edit_perf_{email_sel}",
+                    disabled=eh_sel_master,
+                )
+                usar_modelo_perfil = (not eh_sel_master) and (perfil_edit != u_edit["perfil"])
+                perms_base_edit = (
+                    dict(PERFIS_AUTORIZACAO[perfil_edit]["permissoes"])
+                    if usar_modelo_perfil
+                    else dict(u_edit["permissoes"])
+                )
+
+                with st.form(f"form_adm_edit_u_{email_sel}"):
+                    edit_nome = st.text_input("Nome do usuário", value=u_edit["nome"])
+                    edit_ativo = st.checkbox(
+                        "Usuário ATIVO (desmarque para bloquear o login)",
+                        value=True if eh_sel_master else u_edit["ativo"],
+                        disabled=eh_sel_master,
                     )
-                    usar_modelo_perfil = perfil_edit != u_edit["perfil"]
-                    perms_base_edit = (
-                        dict(PERFIS_AUTORIZACAO[perfil_edit]["permissoes"])
-                        if usar_modelo_perfil
-                        else dict(u_edit["permissoes"])
+                    edit_nova_senha = st.text_input(
+                        "Redefinir senha deste usuário (deixe em branco para manter a senha atual)",
+                        type="password",
                     )
 
-                    with st.form(f"form_adm_edit_u_{email_sel}"):
-                        edit_nome = st.text_input("Nome do usuário", value=u_edit["nome"])
-                        edit_ativo = st.checkbox("Usuário ATIVO (desmarque para bloquear o login)", value=u_edit["ativo"])
-                        edit_nova_senha = st.text_input(
-                            "Redefinir senha deste usuário (deixe em branco para manter a senha atual)",
-                            type="password",
-                        )
+                    st.markdown("**Tipos de Autorizações Liberadas:**")
+                    perms_edit_marcadas = {}
+                    for chave_p, desc_p in PERMISSOES_DESCRICAO.items():
+                        trava_admin = eh_sel_master or (perfil_edit == "ADMIN")
+                        val_atual = True if trava_admin else bool(perms_base_edit.get(chave_p, False))
+                        if trava_admin:
+                            st.checkbox(desc_p, value=True, disabled=True, key=f"adm_ed_{email_sel}_{perfil_edit}_{chave_p}")
+                            perms_edit_marcadas[chave_p] = True
+                        else:
+                            perms_edit_marcadas[chave_p] = st.checkbox(
+                                desc_p,
+                                value=val_atual,
+                                key=f"adm_ed_{email_sel}_{perfil_edit}_{chave_p}",
+                            )
 
-                        st.markdown("**Tipos de Autorizações Liberadas:**")
-                        perms_edit_marcadas = {}
-                        for chave_p, desc_p in PERMISSOES_DESCRICAO.items():
-                            val_atual = True if perfil_edit == "ADMIN" else bool(perms_base_edit.get(chave_p, False))
-                            if perfil_edit == "ADMIN":
-                                st.checkbox(desc_p, value=True, disabled=True, key=f"adm_ed_{email_sel}_{perfil_edit}_{chave_p}")
-                                perms_edit_marcadas[chave_p] = True
+                    st.divider()
+                    senha_admin_edit = st.text_input(
+                        "🔑 Senha do Administrador (obrigatória para salvar alterações) *",
+                        type="password",
+                    )
+                    btn_salvar_u = st.form_submit_button("💾 Salvar Alterações e Autorizações", type="primary", use_container_width=True)
+
+                    if btn_salvar_u:
+                        if not validar_senha_admin(senha_admin_edit):
+                            st.error("❌ Senha do Administrador incorreta! Nenhuma alteração foi salva.")
+                        elif email_sel == usuario_atual and (not edit_ativo or not perms_edit_marcadas.get("gerenciar_usuarios")):
+                            st.error("❌ Você não pode desativar ou remover o acesso de Administrador do seu próprio usuário logado.")
+                        elif edit_nova_senha and len(edit_nova_senha) < 4:
+                            st.error("❌ A nova senha deve ter pelo menos 4 caracteres.")
+                        else:
+                            if eh_sel_master:
+                                perfil_gravar = "ADMIN"
+                                ativo_gravar = True
+                                perms_gravar = {k: True for k in PERMISSOES_DESCRICAO}
                             else:
-                                perms_edit_marcadas[chave_p] = st.checkbox(
-                                    desc_p,
-                                    value=val_atual,
-                                    key=f"adm_ed_{email_sel}_{perfil_edit}_{chave_p}",
-                                )
-
-                        st.divider()
-                        senha_admin_edit = st.text_input(
-                            "🔑 Senha do Administrador (obrigatória para salvar autorizações) *",
-                            type="password",
-                        )
-                        btn_salvar_u = st.form_submit_button("💾 Salvar Alterações e Autorizações", type="primary", use_container_width=True)
-
-                        if btn_salvar_u:
-                            if not validar_senha_admin(senha_admin_edit):
-                                st.error("❌ Senha do Administrador incorreta! Nenhuma alteração foi salva.")
-                            elif email_sel == usuario_atual and (not edit_ativo or not perms_edit_marcadas.get("gerenciar_usuarios")):
-                                st.error("❌ Você não pode desativar ou remover o acesso de Administrador do seu próprio usuário logado.")
-                            elif edit_nova_senha and len(edit_nova_senha) < 4:
-                                st.error("❌ A nova senha deve ter pelo menos 4 caracteres.")
-                            else:
-                                # Se o Admin personalizou checkboxes fora do perfil padrão, marca como PERSONALIZADO (exceto ADMIN)
                                 perfil_gravar = perfil_edit
+                                ativo_gravar = bool(edit_ativo)
+                                perms_gravar = perms_edit_marcadas
                                 if perfil_edit != "ADMIN" and perms_edit_marcadas != PERFIS_AUTORIZACAO[perfil_edit]["permissoes"]:
                                     perfil_gravar = "PERSONALIZADO"
 
-                                with engine.begin() as conn:
-                                    if edit_nova_senha:
-                                        conn.execute(
-                                            text("""
-                                                UPDATE usuarios_sistema SET
-                                                    nome = :n,
-                                                    senha_hash = :sh,
-                                                    perfil = :perf,
-                                                    ativo = :at,
-                                                    permissoes = CAST(:perms AS jsonb),
-                                                    atualizado_em = NOW()
-                                                WHERE LOWER(email) = :e
-                                            """),
-                                            {
-                                                "n": edit_nome.strip(),
-                                                "sh": gerar_hash_senha(edit_nova_senha),
-                                                "perf": perfil_gravar,
-                                                "at": bool(edit_ativo),
-                                                "perms": json.dumps(perms_edit_marcadas, ensure_ascii=False),
-                                                "e": email_sel.lower(),
-                                            },
-                                        )
-                                    else:
-                                        conn.execute(
-                                            text("""
-                                                UPDATE usuarios_sistema SET
-                                                    nome = :n,
-                                                    perfil = :perf,
-                                                    ativo = :at,
-                                                    permissoes = CAST(:perms AS jsonb),
-                                                    atualizado_em = NOW()
-                                                WHERE LOWER(email) = :e
-                                            """),
-                                            {
-                                                "n": edit_nome.strip(),
-                                                "perf": perfil_gravar,
-                                                "at": bool(edit_ativo),
-                                                "perms": json.dumps(perms_edit_marcadas, ensure_ascii=False),
-                                                "e": email_sel.lower(),
-                                            },
-                                        )
-                                st.success(f"✅ Autorizações de '{email_sel}' atualizadas com sucesso!")
-                                st.rerun()
+                            with engine.begin() as conn:
+                                if edit_nova_senha:
+                                    conn.execute(
+                                        text("""
+                                            UPDATE usuarios_sistema SET
+                                                nome = :n,
+                                                senha_hash = :sh,
+                                                perfil = :perf,
+                                                ativo = :at,
+                                                permissoes = CAST(:perms AS jsonb),
+                                                atualizado_em = NOW()
+                                            WHERE LOWER(email) = :e
+                                        """),
+                                        {
+                                            "n": edit_nome.strip(),
+                                            "sh": gerar_hash_senha(edit_nova_senha),
+                                            "perf": perfil_gravar,
+                                            "at": ativo_gravar,
+                                            "perms": json.dumps(perms_gravar, ensure_ascii=False),
+                                            "e": email_sel.lower(),
+                                        },
+                                    )
+                                else:
+                                    conn.execute(
+                                        text("""
+                                            UPDATE usuarios_sistema SET
+                                                nome = :n,
+                                                perfil = :perf,
+                                                ativo = :at,
+                                                permissoes = CAST(:perms AS jsonb),
+                                                atualizado_em = NOW()
+                                            WHERE LOWER(email) = :e
+                                        """),
+                                        {
+                                            "n": edit_nome.strip(),
+                                            "perf": perfil_gravar,
+                                            "at": ativo_gravar,
+                                            "perms": json.dumps(perms_gravar, ensure_ascii=False),
+                                            "e": email_sel.lower(),
+                                        },
+                                    )
+                            st.success(f"✅ Dados e autorizações de '{email_sel}' atualizados com sucesso!")
+                            st.rerun()
 
-                    # Opção de excluir usuário (com proteção contra excluir o próprio admin)
-                    if email_sel != usuario_atual:
-                        with st.expander(f"🗑️ Excluir permanentemente o usuário {email_sel}"):
-                            with st.form(f"form_del_u_{email_sel}", clear_on_submit=True):
-                                st.warning("Atenção: o histórico de propostas criadas por este usuário será mantido, mas o login dele será removido.")
-                                senha_admin_del = st.text_input("🔑 Senha do Administrador para confirmar exclusão *", type="password")
-                                if st.form_submit_button("🗑️ Confirmar Exclusão do Usuário"):
-                                    if validar_senha_admin(senha_admin_del):
-                                        with engine.begin() as conn:
-                                            conn.execute(
-                                                text("DELETE FROM usuarios_sistema WHERE LOWER(email) = :e"),
-                                                {"e": email_sel.lower()},
-                                            )
-                                        st.success(f"Usuário '{email_sel}' excluído.")
-                                        st.rerun()
-                                    else:
-                                        st.error("❌ Senha do Administrador incorreta.")
+                if (not eh_sel_master) and (email_sel != usuario_atual):
+                    with st.expander(f"🗑️ Excluir permanentemente o usuário {email_sel}"):
+                        with st.form(f"form_del_u_{email_sel}", clear_on_submit=True):
+                            st.warning("Atenção: o histórico de propostas criadas por este usuário será mantido, mas o login dele será removido.")
+                            senha_admin_del = st.text_input("🔑 Senha do Administrador para confirmar exclusão *", type="password")
+                            if st.form_submit_button("🗑️ Confirmar Exclusão do Usuário"):
+                                if validar_senha_admin(senha_admin_del):
+                                    with engine.begin() as conn:
+                                        conn.execute(
+                                            text("DELETE FROM usuarios_sistema WHERE LOWER(email) = :e"),
+                                            {"e": email_sel.lower()},
+                                        )
+                                    st.success(f"Usuário '{email_sel}' excluído.")
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Senha do Administrador incorreta.")

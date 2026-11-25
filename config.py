@@ -797,14 +797,19 @@ MUNICIPIOS_BANCOS_150KM_DIVINO = [
 ]
 
 # ============================================================================
-# 10. ADMINISTRADORES E TIPOS DE AUTORIZAÇÕES POR USUÁRIO
+# 10. ADMINISTRADORES MASTER E TIPOS DE AUTORIZAÇÕES POR USUÁRIO
+#     - Os e-mails em ADMIN_MASTER_EMAILS possuem acesso total permanente
+#       (Admin Master) e são protegidos contra desativação ou exclusão.
 #     - Apenas administradores conseguem criar/editar usuários e liberar
 #       autorizações (sempre exigindo confirmação pela senha do Admin).
-#     - Você pode acrescentar outros e-mails de administradores na lista abaixo.
 # ============================================================================
-ADMIN_EMAILS_PADRAO = [
+ADMIN_MASTER_EMAILS = [
+    "regularizeassessoriarural@gmail.com",
     "regularizesulmg@gmail.com",
 ]
+
+# Mantido por compatibilidade interna (aponta para a mesma lista de Admins Master)
+ADMIN_EMAILS_PADRAO = list(ADMIN_MASTER_EMAILS)
 
 # Lista de todas as autorizações disponíveis no sistema
 PERMISSOES_DESCRICAO = {
