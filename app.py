@@ -1262,8 +1262,8 @@ with aba3:
 with aba4:
     st.subheader("🖨️ Impressão de Pacotes Bancários e Documentos Avulsos")
     st.info(
-        "🖨️ **Padrão de Impressão Ativado:** Preto e Branco • Exatamente 1 página A4 por folha • "
-        "Marca d'água da Regularize em todas as folhas."
+        "🖨️ **Padrão de Impressão Ativado:** Preto e Branco • Margens estreitas (folha A4 cheia, 1 página por documento) • "
+        "Marca d'água oficial da Regularize em todas as folhas."
     )
 
     d_pdf = montar_dicionario_proposta()
