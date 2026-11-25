@@ -1,5 +1,5 @@
 # ============================================================================
-# ARQUIVO: app.py (Versão 10.0 — Regularize Assessoria Rural)
+# ARQUIVO: app.py (Versão 11.0 — Regularize Assessoria Rural)
 # O QUE ESTE ARQUIVO FAZ:
 #   Sistema web multiusuário em Português do Brasil (PT-BR) conectado ao
 #   PostgreSQL (Supabase), com:
@@ -159,9 +159,11 @@ def conectar_banco():
                     permissoes JSONB NOT NULL DEFAULT '{}'::jsonb,
                     criado_por VARCHAR(180) DEFAULT 'sistema',
                     criado_em TIMESTAMP DEFAULT NOW(),
-                    atualizado_em TIMESTAMP DEFAULT NOW()
+                    atualizado_em TIMESTAMP DEFAULT NOW(),
+                    ultimo_acesso TIMESTAMP
                 )
             """))
+            conn.execute(text("ALTER TABLE usuarios_sistema ADD COLUMN IF NOT EXISTS ultimo_acesso TIMESTAMP"))
     except Exception:
         pass
 
@@ -298,6 +300,55 @@ def carregar_usuario_db(email):
     }
 
 
+def registrar_atividade_usuario(email, forcar=False):
+    """Atualiza o horário de último acesso do usuário no banco (a cada 2 min ou no login)."""
+    e_norm = str(email or "").strip().lower()
+    if not e_norm:
+        return
+    agora_ts = datetime.now(timezone.utc).timestamp()
+    ultimo_reg = float(st.session_state.get("_ultimo_ping_usuario_ts") or 0.0)
+    if (not forcar) and (agora_ts - ultimo_reg < 120):
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE usuarios_sistema SET ultimo_acesso = NOW() WHERE LOWER(email) = :e"),
+                {"e": e_norm},
+            )
+        st.session_state["_ultimo_ping_usuario_ts"] = agora_ts
+    except Exception:
+        pass
+
+
+def limpar_cache_form_admin_usuario(email_alvo):
+    """Remove chaves temporárias do formulário de edição de um usuário após salvar/alternar status."""
+    alvo = str(email_alvo or "").strip().lower()
+    for k in list(st.session_state.keys()):
+        if alvo and alvo in k and (k.startswith("adm_ed_") or k.startswith("adm_edit_perf_")):
+            del st.session_state[k]
+
+
+def alternar_status_usuario_db(email_alvo, novo_status_ativo):
+    """Ativa ou desativa um usuário diretamente no PostgreSQL (protegendo Admin Master e o próprio admin)."""
+    e_norm = str(email_alvo or "").strip().lower()
+    if eh_admin_master(e_norm):
+        return False, "👑 Contas Admin Master não podem ser desativadas."
+    if e_norm == str(st.session_state.get("usuario_logado") or "").strip().lower() and not novo_status_ativo:
+        return False, "⛔ Você não pode desativar o seu próprio usuário enquanto está logado."
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                UPDATE usuarios_sistema
+                SET ativo = :at, atualizado_em = NOW()
+                WHERE LOWER(email) = :e
+            """),
+            {"at": bool(novo_status_ativo), "e": e_norm},
+        )
+    limpar_cache_form_admin_usuario(e_norm)
+    status_txt = "ATIVADO ✅" if novo_status_ativo else "DESATIVADO ⛔"
+    return True, f"Usuário {e_norm} foi {status_txt} com sucesso!"
+
+
 def validar_senha_admin(senha_digitada):
     """
     Confirma se a senha informada pertence a um Administrador ativo (incluindo os
@@ -370,6 +421,7 @@ def verificar_login():
             st.session_state["usuario_nome"] = u_live["nome"]
             st.session_state["usuario_perfil"] = u_live["perfil"]
             st.session_state["usuario_permissoes"] = u_live["permissoes"]
+        registrar_atividade_usuario(st.session_state["usuario_logado"], forcar=False)
         return st.session_state["usuario_logado"]
 
     st.markdown(f"## 🌱 {EMPRESA['nome_fantasia']}")
@@ -393,6 +445,7 @@ def verificar_login():
                         st.session_state["usuario_nome"] = u_db["nome"]
                         st.session_state["usuario_perfil"] = u_db["perfil"]
                         st.session_state["usuario_permissoes"] = u_db["permissoes"]
+                        registrar_atividade_usuario(u_db["email"], forcar=True)
                         st.rerun()
                     else:
                         st.error("E-mail ou senha incorretos. Verifique com a administração.")
@@ -871,7 +924,7 @@ def cb_buscar_cep():
 def cb_limpar_formulario():
     chaves_manter = {
         "usuario_logado", "usuario_nome", "usuario_perfil",
-        "usuario_permissoes", "_usuarios_sincronizados", "auto_save_ativo",
+        "usuario_permissoes", "_usuarios_sincronizados", "auto_save_ativo", "admin_painel_liberado",
     }
     for k in list(st.session_state.keys()):
         if k not in chaves_manter:
@@ -2331,50 +2384,201 @@ elif aba_ativa == "🗂️ 5. Histórico & Cadastros":
 
 
 # ----------------------------------------------------------------------------
-# ABA 6: PAINEL DO ADMINISTRADOR (ADMIN MASTER, USUÁRIOS E AUTORIZAÇÕES)
+# ABA 6: PAINEL DO ADMINISTRADOR (ÍCONES INTERATIVOS DE USUÁRIOS ATIVOS + SENHA)
 # ----------------------------------------------------------------------------
 elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
     st.subheader("🔐 Administração de Usuários e Autorizações")
-    st.info(
-        "🛡️ **Segurança reforçada:** Apenas Administradores visualizam esta aba. "
-        "Contas **Admin Master** (`regularizeassessoriarural@gmail.com` e `regularizesulmg@gmail.com`) "
-        "possuem proteção permanente. Para adicionar usuários, alterar autorizações ou redefinir senhas, "
-        "é obrigatório confirmar com a **Senha do Administrador**."
-    )
 
+    # ========================================================================
+    # DESBLOQUEIO DO PAINEL POR SENHA DO ADMINISTRADOR
+    # (Permite clicar direto nos ícones ✅ Ativo / ⛔ Desativado e gerenciar tudo!)
+    # ========================================================================
+    painel_liberado = bool(st.session_state.get("admin_painel_liberado", False))
+    with st.container(border=True):
+        if painel_liberado:
+            c_st1, c_st2 = st.columns([3.5, 1.0])
+            c_st1.success(
+                "🔓 **Painel Administrativo Desbloqueado!** Agora você pode clicar diretamente nos ícones "
+                "**✅ Ativo / ⛔ Desativado** para ligar ou bloquear qualquer usuário na hora, além de criar e editar autorizações."
+            )
+            c_st2.write("")
+            if c_st2.button("🔒 Bloquear Painel", use_container_width=True):
+                st.session_state["admin_painel_liberado"] = False
+                st.rerun()
+        else:
+            st.info(
+                "🛡️ **Proteção por Senha do Administrador:** Para ativar/desativar usuários clicando nos ícones, "
+                "adicionar novos acessos ou alterar autorizações, informe a **Senha do Administrador** abaixo."
+            )
+            with st.form("form_desbloquear_painel_admin", clear_on_submit=True):
+                cu1, cu2 = st.columns([3, 1.2])
+                senha_unlock = cu1.text_input(
+                    "🔑 Senha do Administrador",
+                    type="password",
+                    placeholder="Digite sua senha de Administrador e clique em Desbloquear",
+                    label_visibility="collapsed",
+                )
+                if cu2.form_submit_button("🔓 Desbloquear Painel", type="primary", use_container_width=True):
+                    if validar_senha_admin(senha_unlock):
+                        st.session_state["admin_painel_liberado"] = True
+                        st.toast("🔓 Painel Administrativo desbloqueado!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Senha do Administrador incorreta.")
+
+    if st.session_state.get("_msg_admin_acao"):
+        tipo_m, txt_m = st.session_state["_msg_admin_acao"]
+        if tipo_m == "ok":
+            st.success(txt_m)
+        elif tipo_m == "warn":
+            st.warning(txt_m)
+        else:
+            st.error(txt_m)
+        st.session_state["_msg_admin_acao"] = None
+
+    # Carregar usuários diretamente do PostgreSQL
     with engine.connect() as conn:
         df_users = pd.read_sql(
             text("""
-                SELECT email, nome, perfil, ativo, permissoes, criado_por, criado_em, atualizado_em
+                SELECT email, nome, perfil, ativo, permissoes, criado_por, criado_em, atualizado_em, ultimo_acesso
                 FROM usuarios_sistema
-                ORDER BY ativo DESC, perfil, email
+                ORDER BY LOWER(email)
             """),
             conn,
         )
 
-    st.markdown("#### 👥 Usuários Cadastrados e Suas Autorizações")
-    if not df_users.empty:
-        linhas_u = []
-        for _, ru in df_users.iterrows():
-            eh_m = eh_admin_master(ru["email"])
-            p_dict = ru["permissoes"] if isinstance(ru["permissoes"], dict) else {}
-            perms_ativas = [
-                k.replace("_", " ").title()
-                for k in PERMISSOES_DESCRICAO.keys()
-                if (eh_m or ru["perfil"] == "ADMIN" or p_dict.get(k, False))
-            ]
-            rotulo_perf = "👑 ADMIN MASTER" if eh_m else ru["perfil"]
-            linhas_u.append({
-                "E-mail": ru["email"],
-                "Nome": ru["nome"] or "",
-                "Perfil": rotulo_perf,
-                "Status": "✅ Ativo" if (eh_m or ru["ativo"]) else "⛔ Desativado",
-                "Autorizações Liberadas": ", ".join(perms_ativas) if perms_ativas else "Nenhuma",
-                "Criado por": ru["criado_por"] or "",
-            })
-        st.dataframe(pd.DataFrame(linhas_u), use_container_width=True, hide_index=True)
+    # Métricas rápidas no topo
+    agora_utc = datetime.now(timezone.utc)
+    total_u = len(df_users)
+    ativos_u = 0
+    inativos_u = 0
+    online_u = 0
+    registros_u = []
+
+    for _, ru in df_users.iterrows():
+        email_u = str(ru["email"]).strip().lower()
+        eh_m = eh_admin_master(email_u)
+        esta_ativo = True if eh_m else bool(ru["ativo"])
+        if esta_ativo:
+            ativos_u += 1
+        else:
+            inativos_u += 1
+
+        ult_acesso = ru.get("ultimo_acesso")
+        esta_online = False
+        ult_txt = "Ainda não acessou"
+        if pd.notna(ult_acesso):
+            dt_u = pd.to_datetime(ult_acesso)
+            if dt_u.tzinfo is None:
+                dt_u = dt_u.tz_localize("UTC")
+            diff_min = (agora_utc - dt_u.to_pydatetime()).total_seconds() / 60.0
+            if diff_min <= 10:
+                esta_online = True
+                online_u += 1
+            dt_br = dt_u.astimezone(FUSO_BRASILIA)
+            ult_txt = dt_br.strftime("%d/%m/%Y %H:%M")
+
+        p_dict = ru["permissoes"] if isinstance(ru["permissoes"], dict) else {}
+        perms_ativas = [
+            k.replace("_", " ").title()
+            for k in PERMISSOES_DESCRICAO.keys()
+            if (eh_m or ru["perfil"] == "ADMIN" or p_dict.get(k, False))
+        ]
+        registros_u.append({
+            "email": email_u,
+            "nome": ru["nome"] or email_u.split("@")[0].title(),
+            "perfil": ru["perfil"],
+            "eh_master": eh_m,
+            "ativo": esta_ativo,
+            "online": esta_online,
+            "ultimo_acesso_txt": ult_txt,
+            "perms_resumo": ", ".join(perms_ativas) if perms_ativas else "Nenhuma",
+        })
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("👥 Total de Usuários", total_u)
+    m2.metric("✅ Usuários Ativos", ativos_u)
+    m3.metric("⛔ Desativados", inativos_u)
+    m4.metric("🟢 Online Agora", online_u)
+
+    # ========================================================================
+    # LISTA INTERATIVA DE USUÁRIOS (ÍCONES ✅ ATIVO / ⛔ DESATIVADO CLICÁVEIS!)
+    # ========================================================================
+    st.markdown("#### 👥 Usuários Cadastrados — Clique no ícone de Status para Ativar ou Desativar")
+    if not registros_u:
+        st.info("Nenhum usuário cadastrado ainda.")
     else:
-        st.info("Nenhum usuário cadastrado na tabela ainda.")
+        with st.container(border=True):
+            h1, h2, h3, h4, h5 = st.columns([1.25, 2.3, 1.35, 2.6, 0.95])
+            h1.markdown("**Status (Clique)**")
+            h2.markdown("**Usuário / Presença**")
+            h3.markdown("**Perfil**")
+            h4.markdown("**Autorizações Liberadas**")
+            h5.markdown("**Ação**")
+            st.divider()
+
+            def _cb_selecionar_usuario_edicao(email_escolhido):
+                st.session_state["adm_edit_sel"] = email_escolhido
+
+            for idx_u, r in enumerate(registros_u):
+                c_st, c_usr, c_prf, c_prm, c_ed = st.columns([1.25, 2.3, 1.35, 2.6, 0.95])
+
+                # 1. Ícone/Botão clicável de Status (Ativo / Desativado)
+                if r["eh_master"]:
+                    c_st.button(
+                        "👑 Ativo",
+                        key=f"btn_status_u_{idx_u}_{r['email']}",
+                        disabled=True,
+                        help="Conta Admin Master sempre ativa e protegida.",
+                        use_container_width=True,
+                    )
+                else:
+                    label_st = "✅ Ativo" if r["ativo"] else "⛔ Desativado"
+                    help_st = (
+                        "Clique para DESATIVAR (bloquear login) deste usuário."
+                        if r["ativo"]
+                        else "Clique para ATIVAR (liberar login) deste usuário."
+                    )
+                    if c_st.button(
+                        label_st,
+                        key=f"btn_status_u_{idx_u}_{r['email']}",
+                        help=help_st,
+                        use_container_width=True,
+                    ):
+                        if not painel_liberado:
+                            st.session_state["_msg_admin_acao"] = (
+                                "warn",
+                                "🔒 Digite a **Senha do Administrador** no topo da Aba 6 e clique em **🔓 Desbloquear Painel** para ativar ou desativar usuários pelos ícones.",
+                            )
+                            st.rerun()
+                        else:
+                            ok, msg_res = alternar_status_usuario_db(r["email"], not r["ativo"])
+                            st.session_state["_msg_admin_acao"] = ("ok" if ok else "err", msg_res)
+                            st.toast(msg_res)
+                            st.rerun()
+
+                # 2. Nome, e-mail e indicador online / último acesso
+                badge_presenca = "🟢 **Online agora**" if r["online"] else f"⚪ Acesso: {r['ultimo_acesso_txt']}"
+                c_usr.markdown(f"**{r['nome']}**  \n`{r['email']}`  \n{badge_presenca}")
+
+                # 3. Perfil
+                rot_p = "👑 ADMIN MASTER" if r["eh_master"] else f"🛡️ {r['perfil']}"
+                c_prf.markdown(f"**{rot_p}**")
+
+                # 4. Autorizações resumidas
+                c_prm.caption(r["perms_resumo"])
+
+                # 5. Botão rápido para abrir no editor abaixo
+                c_ed.button(
+                    "⚙️ Editar",
+                    key=f"btn_editar_u_{idx_u}_{r['email']}",
+                    on_click=_cb_selecionar_usuario_edicao,
+                    args=(r["email"],),
+                    use_container_width=True,
+                )
+
+                if idx_u < len(registros_u) - 1:
+                    st.markdown("<hr style='margin:6px 0; border:none; border-top:1px solid #E2E8F0;'>", unsafe_allow_html=True)
 
     st.divider()
     col_add_u, col_edit_u = st.columns(2)
@@ -2415,14 +2619,19 @@ elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
                     )
 
             st.divider()
-            senha_admin_add = st.text_input(
-                "🔑 Senha do Administrador (obrigatória para liberar cadastro) *",
-                type="password",
-            )
+            if painel_liberado:
+                senha_admin_add = ""
+                st.caption("🔓 Painel já desbloqueado pela Senha do Administrador nesta sessão.")
+            else:
+                senha_admin_add = st.text_input(
+                    "🔑 Senha do Administrador (obrigatória para liberar cadastro) *",
+                    type="password",
+                )
             btn_criar_u = st.form_submit_button("✅ Criar Usuário e Liberar Autorizações", type="primary", use_container_width=True)
 
             if btn_criar_u:
-                if not validar_senha_admin(senha_admin_add):
+                autorizado_add = painel_liberado or validar_senha_admin(senha_admin_add)
+                if not autorizado_add:
                     st.error("❌ Senha do Administrador incorreta! Operação bloqueada.")
                 elif not novo_nome_u.strip() or not novo_email_u or "@" not in novo_email_u:
                     st.error("❌ Informe um Nome e um E-mail válido.")
@@ -2431,6 +2640,7 @@ elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
                 elif nova_senha_u != nova_senha_u2:
                     st.error("❌ A confirmação da senha inicial não confere.")
                 else:
+                    st.session_state["admin_painel_liberado"] = True
                     if perfil_novo == "ADMIN":
                         perms_finais = {k: True for k in PERMISSOES_DESCRICAO}
                     else:
@@ -2460,7 +2670,7 @@ elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
                                     "cp": usuario_atual,
                                 },
                             )
-                            st.success(f"✅ Usuário '{novo_nome_u.strip()}' ({novo_email_u}) criado com sucesso!")
+                            st.session_state["_msg_admin_acao"] = ("ok", f"✅ Usuário '{novo_nome_u.strip()}' ({novo_email_u}) criado com sucesso!")
                             st.rerun()
 
     # ========================================================================
@@ -2472,6 +2682,8 @@ elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
             st.caption("Cadastre o primeiro usuário ao lado.")
         else:
             lista_emails_u = ordenar_alfabetico_ptbr(df_users["email"].tolist())
+            if st.session_state.get("adm_edit_sel") not in lista_emails_u:
+                st.session_state["adm_edit_sel"] = lista_emails_u[0]
             email_sel = st.selectbox("Selecione o usuário para configurar:", lista_emails_u, key="adm_edit_sel")
             u_edit = carregar_usuario_db(email_sel)
 
@@ -2497,12 +2709,13 @@ elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
                     else dict(u_edit["permissoes"])
                 )
 
-                with st.form(f"form_adm_edit_u_{email_sel}"):
-                    edit_nome = st.text_input("Nome do usuário", value=u_edit["nome"])
+                with st.form(f"form_adm_edit_u_{email_sel}_{u_edit['ativo']}"):
+                    edit_nome = st.text_input("Nome do usuário", value=u_edit["nome"], key=f"adm_ed_nome_{email_sel}")
                     edit_ativo = st.checkbox(
                         "Usuário ATIVO (desmarque para bloquear o login)",
                         value=True if eh_sel_master else u_edit["ativo"],
                         disabled=eh_sel_master,
+                        key=f"adm_ed_ativo_{email_sel}_{u_edit['ativo']}",
                     )
                     edit_nova_senha = st.text_input(
                         "Redefinir senha deste usuário (deixe em branco para manter a senha atual)",
@@ -2525,20 +2738,26 @@ elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
                             )
 
                     st.divider()
-                    senha_admin_edit = st.text_input(
-                        "🔑 Senha do Administrador (obrigatória para salvar alterações) *",
-                        type="password",
-                    )
+                    if painel_liberado:
+                        senha_admin_edit = ""
+                        st.caption("🔓 Painel já desbloqueado pela Senha do Administrador nesta sessão.")
+                    else:
+                        senha_admin_edit = st.text_input(
+                            "🔑 Senha do Administrador (obrigatória para salvar alterações) *",
+                            type="password",
+                        )
                     btn_salvar_u = st.form_submit_button("💾 Salvar Alterações e Autorizações", type="primary", use_container_width=True)
 
                     if btn_salvar_u:
-                        if not validar_senha_admin(senha_admin_edit):
+                        autorizado_edit = painel_liberado or validar_senha_admin(senha_admin_edit)
+                        if not autorizado_edit:
                             st.error("❌ Senha do Administrador incorreta! Nenhuma alteração foi salva.")
                         elif email_sel == usuario_atual and (not edit_ativo or not perms_edit_marcadas.get("gerenciar_usuarios")):
                             st.error("❌ Você não pode desativar ou remover o acesso de Administrador do seu próprio usuário logado.")
                         elif edit_nova_senha and len(edit_nova_senha) < 4:
                             st.error("❌ A nova senha deve ter pelo menos 4 caracteres.")
                         else:
+                            st.session_state["admin_painel_liberado"] = True
                             if eh_sel_master:
                                 perfil_gravar = "ADMIN"
                                 ativo_gravar = True
@@ -2591,7 +2810,8 @@ elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
                                             "e": email_sel.lower(),
                                         },
                                     )
-                            st.success(f"✅ Dados e autorizações de '{email_sel}' atualizados com sucesso!")
+                            limpar_cache_form_admin_usuario(email_sel)
+                            st.session_state["_msg_admin_acao"] = ("ok", f"✅ Dados e autorizações de '{email_sel}' atualizados com sucesso!")
                             st.rerun()
 
                 if (not eh_sel_master) and (email_sel != usuario_atual):
@@ -2606,7 +2826,8 @@ elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
                                             text("DELETE FROM usuarios_sistema WHERE LOWER(email) = :e"),
                                             {"e": email_sel.lower()},
                                         )
-                                    st.success(f"Usuário '{email_sel}' excluído.")
+                                    limpar_cache_form_admin_usuario(email_sel)
+                                    st.session_state["_msg_admin_acao"] = ("ok", f"🗑️ Usuário '{email_sel}' excluído permanentemente.")
                                     st.rerun()
                                 else:
                                     st.error("❌ Senha do Administrador incorreta.")
