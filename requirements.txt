@@ -1,6 +1,11 @@
+# ============================================================================
+# Bibliotecas Python instaladas automaticamente pelo Streamlit Cloud
+# Já atualizado com psycopg[binary] compatível com Python 3.12 / 3.13 / 3.14!
+# ============================================================================
 streamlit>=1.38.0
 pandas>=2.0.0
 sqlalchemy>=2.0.0
 psycopg[binary]>=3.2.0
 openpyxl>=3.1.2
 reportlab>=4.2.0
+Pillow>=10.0.0
