@@ -64,7 +64,7 @@ def fmt_moeda(valor, vazio_se_zero=True):
     Se o valor for vazio, None ou 0 (com vazio_se_zero=True), retorna '' (em branco).
     """
     if valor is None or str(valor).strip() == "":
-        return ""
+        return "" if vazio_se_zero else "R$ 0,00"
     try:
         v = float(valor)
     except (TypeError, ValueError):
@@ -74,6 +74,30 @@ def fmt_moeda(valor, vazio_se_zero=True):
     sinal = "-" if v < 0 else ""
     texto = f"{abs(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     return f"{sinal}R$ {texto}"
+
+
+def fmt_valor_sem_rs(valor):
+    """Formata 1200 como '1.200,00' (sem 'R$'). Se vazio ou zero, retorna ''."""
+    if valor is None or str(valor).strip() == "":
+        return ""
+    try:
+        v = float(valor)
+    except (TypeError, ValueError):
+        return ""
+    if abs(v) < 0.005:
+        return ""
+    return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def fmt_pct_br(valor_pct):
+    """Formata porcentagem no padrão brasileiro com vírgula (ex.: 0.5 -> '0,50%')."""
+    try:
+        v = float(valor_pct or 0)
+    except (TypeError, ValueError):
+        return ""
+    if abs(v) < 1e-6:
+        return ""
+    return f"{v:.2f}%".replace(".", ",")
 
 
 def fmt_num(valor):
@@ -401,6 +425,10 @@ def enquadrar_uma_folha(elementos):
 # ============================================================================
 def doc_nova_proposta(d, est):
     W = LARGURA_UTIL
+    banco_nome_p = safe(d.get("banco_destino"))
+    banco_mun_p = safe(d.get("banco_municipio"))
+    banco_completo_p = f"{banco_nome_p} — {banco_mun_p}" if (banco_nome_p and banco_mun_p) else (banco_nome_p or banco_mun_p)
+
     g_cab = bloco_cabecalho_planilha("CARTA-PROPOSTA", est) + [
         Spacer(1, 3),
         tabela_pb([
@@ -408,9 +436,9 @@ def doc_nova_proposta(d, est):
                 Paragraph(f"<b>Local:</b> {safe(d.get('local_emissao'))}", est["normal"]),
                 Paragraph(f"<b>Data:</b> {fmt_data_br(d.get('data_proposta'))}", est["normal"]),
                 Paragraph(f"<b>Parceiro:</b> {safe(d.get('parceiro') or EMPRESA['nome_fantasia'])}", est["normal"]),
-                Paragraph(f"<b>Banco:</b> {safe(d.get('banco_destino'))}", est["normal"]),
+                Paragraph(f"<b>Banco / Cooperativa:</b> {banco_completo_p}", est["compacto"]),
             ]
-        ], [3.3 * cm, 3.0 * cm, 7.1 * cm, 4.8 * cm], est, pad_v=2.5),
+        ], [3.0 * cm, 2.8 * cm, 6.2 * cm, 6.2 * cm], est, pad_v=2.5),
     ]
 
     g_cli = [
@@ -485,21 +513,49 @@ def doc_nova_proposta(d, est):
         tabela_pb(linhas_chk, [6.8 * cm, 6.2 * cm, 5.2 * cm], est, cabecalho_cinza=True, pad_v=1.8),
     ]
 
-    # MARGEM CRÉDITO PESSOAL (100% em branco quando não preenchido!)
+    # MARGEM CRÉDITO PESSOAL (Opções para marcar X + Valor com R$ apenas + Consórcio melhorado)
+    cred_tipo_raw = str(d.get("credito_tipo") or "").upper()
+    # Normaliza acentos para reconhecer tanto 'AUTOMATICO' quanto 'AUTOMÁTICO'
+    cred_norm = (
+        cred_tipo_raw.replace("Á", "A").replace("É", "E").replace("Í", "I")
+        .replace("Ó", "O").replace("Ú", "U").replace("Ã", "A").replace("Õ", "O")
+    )
+    def _chk_cred(chave_sem_acento, rotulo_exib):
+        marca = "X" if chave_sem_acento in cred_norm else "&nbsp;&nbsp;"
+        return f"[<b>{marca}</b>] {rotulo_exib}"
+
+    opcoes_cred_html = (
+        f"<b>Crédito:</b> &nbsp; "
+        f"{_chk_cred('CONSIGNADO', 'Consignado')} &nbsp;&nbsp; "
+        f"{_chk_cred('AUTOMATICO', 'Automático')} &nbsp;&nbsp; "
+        f"{_chk_cred('SALARIO', 'Salário')} &nbsp;&nbsp; "
+        f"{_chk_cred('BENEFICIO', 'Benefício')}"
+    )
+    val_cred_num = d.get("credito_valor")
+    if not val_cred_num and d.get("beneficio_valor"):
+        val_cred_num = d.get("beneficio_valor")
+    val_cred_str = fmt_valor_sem_rs(val_cred_num)
+    val_parc_cons_str = fmt_valor_sem_rs(d.get("parcela_consorcio"))
+    qtd_parc_cons_str = fmt_num(d.get("num_parcelas_consorcio"))
+
+    t_margem_top = tabela_pb([
+        [
+            Paragraph(opcoes_cred_html, est["normal"]),
+            Paragraph(f"<b>Valor:</b> R$ {val_cred_str}", est["normal"]),
+        ]
+    ], [12.4 * cm, 5.8 * cm], est, pad_v=3.0)
+
+    t_margem_cons = tabela_pb([
+        [
+            Paragraph(f"<b>Valor da Parcela do Consórcio:</b> R$ {val_parc_cons_str}", est["normal"]),
+            Paragraph(f"<b>Quantidade de Parcelas do Consórcio:</b> {qtd_parc_cons_str}", est["normal"]),
+        ]
+    ], [9.1 * cm, 9.1 * cm], est, pad_v=3.0)
+
     g_margem = [
         faixa_secao("MARGEM CRÉDITO PESSOAL", est),
-        tabela_pb([
-            [
-                Paragraph(f"<b>Crédito:</b> {safe(d.get('credito_tipo'))}", est["normal"]),
-                Paragraph(f"<b>Valor:</b> {fmt_moeda(d.get('credito_valor'))}", est["normal"]),
-                Paragraph(f"<b>Benefício:</b> {fmt_moeda(d.get('beneficio_valor'))}", est["normal"]),
-            ],
-            [
-                Paragraph(f"<b>Parcela Consórcio:</b> {fmt_moeda(d.get('parcela_consorcio'))}", est["normal"]),
-                Paragraph(f"<b>Nº Parcelas:</b> {fmt_num(d.get('num_parcelas_consorcio'))}", est["normal"]),
-                Paragraph("", est["normal"]),
-            ],
-        ], [6.4 * cm, 5.9 * cm, 5.9 * cm], est, pad_v=2.5),
+        t_margem_top,
+        t_margem_cons,
     ]
 
     # PARECER DA AGÊNCIA BANCÁRIA
@@ -627,9 +683,9 @@ def doc_producao(d, est):
                 Paragraph(f"<b>Prod. 2024:</b> {safe(p.get('prod_2024'))}", est["compacto"]),
             ],
             [
-                Paragraph(f"<b>Venda 2026:</b> {fmt_moeda(p.get('venda_2026'))}", est["compacto"]),
-                Paragraph(f"<b>Venda 2025:</b> {fmt_moeda(p.get('venda_2025'))}", est["compacto"]),
-                Paragraph(f"<b>Venda 2024:</b> {fmt_moeda(p.get('venda_2024'))}", est["compacto"]),
+                Paragraph(f"<b>Venda 2026:</b> {fmt_moeda(p.get('venda_2026'), vazio_se_zero=False)}", est["compacto"]),
+                Paragraph(f"<b>Venda 2025:</b> {fmt_moeda(p.get('venda_2025'), vazio_se_zero=False)}", est["compacto"]),
+                Paragraph(f"<b>Venda 2024:</b> {fmt_moeda(p.get('venda_2024'), vazio_se_zero=False)}", est["compacto"]),
                 Paragraph(f"<b>Variedades:</b> {safe(p.get('variedades'))}", est["compacto"]),
             ],
         ], colWidths=[4.55 * cm, 4.55 * cm, 4.55 * cm, 4.55 * cm])
@@ -651,12 +707,22 @@ def doc_producao(d, est):
 
     sem = prod.get("semoventes") or {}
     re1_desc = safe(prod.get("renda_extra_1_desc"))
-    re1_val = fmt_moeda(prod.get("renda_extra_1_val"))
-    re1_txt = f"{re1_desc} ({re1_val})" if (re1_desc and re1_val) else (re1_desc or re1_val)
+    re1_val_num = float(prod.get("renda_extra_1_val") or 0.0)
+    re1_val = fmt_moeda(re1_val_num, vazio_se_zero=False)
+    re1_txt = f"{re1_desc} ({re1_val})" if re1_desc else re1_val
 
     re2_desc = safe(prod.get("renda_extra_2_desc"))
-    re2_val = fmt_moeda(prod.get("renda_extra_2_val"))
-    re2_txt = f"{re2_desc} ({re2_val})" if (re2_desc and re2_val) else (re2_desc or re2_val)
+    re2_val_num = float(prod.get("renda_extra_2_val") or 0.0)
+    re2_val = fmt_moeda(re2_val_num, vazio_se_zero=False)
+    re2_txt = f"{re2_desc} ({re2_val})" if re2_desc else re2_val
+
+    # Recalcula a Renda Bruta Anual somando todas as vendas 2026 + rendas extras (sempre exibe R$ 0,00 ou soma)
+    soma_vendas_2026 = sum(float(px.get("venda_2026") or 0.0) for px in props)
+    renda_bruta_calc = round(soma_vendas_2026 + re1_val_num + re2_val_num, 2)
+    if d.get("renda_bruta_anual") is not None and float(d.get("renda_bruta_anual") or 0.0) > 0:
+        renda_bruta_exib = float(d.get("renda_bruta_anual"))
+    else:
+        renda_bruta_exib = renda_bruta_calc
 
     g_sem = [
         faixa_secao("SEMOVENTES, RENDA EXTRA E BENS", est),
@@ -664,7 +730,7 @@ def doc_producao(d, est):
             [
                 Paragraph(f"<b>Vacas de Leite:</b> {fmt_num(sem.get('vacas_leite'))}", est["normal"]),
                 Paragraph(f"<b>Litros por Dia:</b> {fmt_num(sem.get('litros_dia'))}", est["normal"]),
-                Paragraph(f"<b>Preço por Litro:</b> {fmt_moeda(sem.get('preco_litro'))}", est["normal"]),
+                Paragraph(f"<b>Preço por Litro:</b> {fmt_moeda(sem.get('preco_litro'), vazio_se_zero=False)}", est["normal"]),
             ],
             [
                 Paragraph(f"<b>Boi de Corte:</b> {fmt_num(sem.get('boi_corte'))}", est["normal"]),
@@ -674,7 +740,7 @@ def doc_producao(d, est):
             [
                 Paragraph(f"<b>Renda Extra 1:</b> {re1_txt}", est["normal"]),
                 Paragraph(f"<b>Renda Extra 2:</b> {re2_txt}", est["normal"]),
-                Paragraph(f"<b>RENDA BRUTA ANUAL: {fmt_moeda(d.get('renda_bruta_anual'))}</b>", est["normal_bold"]),
+                Paragraph(f"<b>RENDA BRUTA ANUAL: {fmt_moeda(renda_bruta_exib, vazio_se_zero=False)}</b>", est["normal_bold"]),
             ],
         ], [6.1 * cm, 6.0 * cm, 6.1 * cm], est, pad_v=3.2),
         tabela_pb([
@@ -758,7 +824,7 @@ def doc_ordem_servico(d, est):
         Paragraph("<b>OBS.:</b> Será cobrado do produtor o valor INTEGRAL dos serviços do ATER (escritório) conforme esta Ordem de Serviço. Em caso de desistência do produtor durante o processo de Crédito Rural, o pagamento será devido integralmente, visto que o serviço já foi executado.", est["pequeno"]),
     ]
 
-    # Cálculos financeiros (campos zerados/vazios ficam em branco!)
+    # Cálculos financeiros da Ordem de Serviço
     val_prop = float(d.get("valor_proposto") or 0)
     tem_valor = val_prop > 0
     val_cheio = float(d.get("valor_cheio_os") or round(val_prop * TAXA_HONORARIO_CHEIA, 2)) if tem_valor else 0.0
@@ -769,30 +835,19 @@ def doc_ordem_servico(d, est):
     desc_total = round(desc_faixa + desc_extra, 2)
     acresc = float(d.get("acrescimos") or 0.0)
     total_os = max(0.0, round(val_cheio - desc_total + acresc, 2)) if (tem_valor or acresc > 0) else 0.0
-    n_parc_raw = d.get("num_parcelas")
-    n_parc = int(n_parc_raw) if (n_parc_raw is not None and str(n_parc_raw).strip() != "" and int(n_parc_raw) > 0) else None
-    val_parc = round(total_os / n_parc, 2) if (n_parc and total_os > 0) else 0.0
 
-    if tem_valor and desc_faixa > 0 and desc_extra > 0:
-        rotulo_desc = f"Desconto Concedido (Faixa {pct_desc_faixa*100:.2f}% + Extra)"
-    elif tem_valor and desc_faixa > 0:
-        if pct_final == 0:
-            rotulo_desc = "Desconto Concedido (Isenção — 2,00%)"
+    # Porcentagem de desconto concedida (exibe APENAS a porcentagem no campo Desconto!)
+    if tem_valor and desc_total > 0:
+        if desc_extra > 0:
+            pct_desc_exibir = (desc_total / val_prop) * 100.0
         else:
-            rotulo_desc = f"Desconto Concedido ({pct_desc_faixa*100:.2f}% — Taxa final {pct_final*100:.2f}%)"
-    elif desc_extra > 0:
-        rotulo_desc = "Desconto Concedido"
+            pct_desc_exibir = pct_desc_faixa * 100.0
+        txt_desconto_pct = fmt_pct_br(pct_desc_exibir)
+    elif pct_desc_faixa > 0 and tem_valor:
+        txt_desconto_pct = fmt_pct_br(pct_desc_faixa * 100.0)
     else:
-        rotulo_desc = "Desconto"
+        txt_desconto_pct = ""
 
-    if n_parc and val_parc > 0:
-        txt_parc = f"<b>Parcelamento:</b> {n_parc} parcela(s) de <b>{fmt_moeda(val_parc)}</b>"
-    elif n_parc:
-        txt_parc = f"<b>Parcelamento:</b> {n_parc} parcela(s)"
-    else:
-        txt_parc = "<b>Parcelamento:</b>"
-
-    txt_taxa_ef = f"<i>Taxa efetiva aplicada ao cliente: <b>{pct_final*100:.2f}%</b></i>" if tem_valor else ""
     txt_total_os = fmt_moeda(total_os, vazio_se_zero=(not (tem_valor and pct_final == 0)))
     if tem_valor and pct_final == 0 and total_os == 0:
         txt_total_os = "ISENTO"
@@ -800,28 +855,27 @@ def doc_ordem_servico(d, est):
     g_fin = [
         faixa_secao("SERVIÇOS PRESTADOS E CONDIÇÕES FINANCEIRAS", est),
         tabela_pb([
-            ["Item", "Serviços Prestados", "Faixa Cheia", "Total"],
+            ["Item", "Serviços Prestados", "Total"],
             [
                 "1",
-                Paragraph("<b>PROJETO TÉCNICO</b> (Honorários Base — Valor Cheio 2,00%)", est["normal"]),
-                Paragraph("2,00%" if tem_valor else "", est["centro"]),
+                Paragraph("<b>PROJETO TÉCNICO</b>", est["normal"]),
                 Paragraph(fmt_moeda(val_cheio), est["direita"]),
             ],
-            ["2", Paragraph("&nbsp;", est["normal"]), "", ""],
-        ], [1.2 * cm, 10.8 * cm, 2.4 * cm, 3.8 * cm], est, cabecalho_cinza=True, pad_v=3.8),
+            ["2", Paragraph("&nbsp;", est["normal"]), ""],
+        ], [1.3 * cm, 13.1 * cm, 3.8 * cm], est, cabecalho_cinza=True, pad_v=4.0),
         Table([
             [
-                Paragraph(f"<b>Forma de Pagamento:</b> {safe(d.get('forma_pagamento'))}", est["normal"]),
-                Paragraph("<b>Subtotal (Valor Cheio 2,00%)</b>", est["direita"]),
+                Paragraph(f"<b>Forma de Pagamento:</b><br/>{safe(d.get('forma_pagamento'))}", est["normal"]),
+                Paragraph("<b>Subtotal</b>", est["direita"]),
                 Paragraph(fmt_moeda(val_cheio), est["direita"]),
             ],
             [
-                Paragraph(txt_parc, est["normal"]),
-                Paragraph(f"<b>{safe(rotulo_desc)}</b>", est["direita"]),
-                Paragraph(f"- {fmt_moeda(desc_total)}" if desc_total > 0 else "", est["direita"]),
+                "",
+                Paragraph("<b>Desconto</b>", est["direita"]),
+                Paragraph(txt_desconto_pct, est["direita"]),
             ],
             [
-                Paragraph(txt_taxa_ef, est["compacto"]),
+                "",
                 Paragraph("<b>Acréscimos</b>", est["direita"]),
                 Paragraph(fmt_moeda(acresc), est["direita"]),
             ],
@@ -830,16 +884,19 @@ def doc_ordem_servico(d, est):
                 Paragraph("<b>TOTAL A PAGAR</b>", est["direita_bold"]),
                 Paragraph(f"<b>{txt_total_os}</b>", est["direita_bold"]),
             ],
-        ], colWidths=[8.3 * cm, 6.1 * cm, 3.8 * cm]),
+        ], colWidths=[10.2 * cm, 4.2 * cm, 3.8 * cm]),
     ]
     g_fin[-1].setStyle(TableStyle([
+        ("SPAN", (0, 0), (0, 2)),
         ("GRID", (0, 0), (-1, -1), 0.55, est["cor_borda"]),
         ("BACKGROUND", (1, 3), (2, 3), est["cor_faixa"]),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("VALIGN", (0, 0), (0, 2), "TOP"),
+        ("VALIGN", (1, 0), (-1, -1), "MIDDLE"),
+        ("VALIGN", (0, 3), (0, 3), "MIDDLE"),
         ("LEFTPADDING", (0, 0), (-1, -1), 5),
         ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 3.8),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3.8),
+        ("TOPPADDING", (0, 0), (-1, -1), 4.0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4.0),
     ]))
 
     g_rodape = [
@@ -899,7 +956,9 @@ def doc_protecao_dados(d, est):
     g_p1 = [Paragraph(safe(p1), est["justificado_grande"])]
 
     banco_sel = safe(d.get("banco_destino"))
-    inst_txt = f"{banco_sel} (Instituições financeiras e cooperativas de crédito)" if banco_sel else "Instituições financeiras e cooperativas de crédito"
+    banco_mun = safe(d.get("banco_municipio"))
+    banco_full = f"{banco_sel} — {banco_mun}" if (banco_sel and banco_mun) else (banco_sel or banco_mun)
+    inst_txt = f"{banco_full} (Instituições financeiras e cooperativas de crédito)" if banco_full else "Instituições financeiras e cooperativas de crédito"
     g_tab = [tabela_pb([
         [
             Paragraph(f"<b>Contabilidade Indicada:</b> {safe(d.get('contabilidade_nome'))}", est["normal"]),
@@ -1261,7 +1320,7 @@ def doc_invest_caixa(d, est):
     g_id = [tabela_pb([
         [
             Paragraph(f"<b>Cód. Agência:</b> {safe(EMPRESA['caixa_cod_agencia'])}", est["normal"]),
-            Paragraph(f"<b>Nome da Agência:</b> {safe(EMPRESA['caixa_nome_agencia'])}", est["normal"]),
+            Paragraph(f"<b>Nome da Agência:</b> {safe(d.get('banco_municipio') or EMPRESA['caixa_nome_agencia'])}", est["normal"]),
         ],
         [
             Paragraph(f"<b>Nome/Razão Social:</b> {safe(d.get('cliente_nome'))}", est["normal"]),

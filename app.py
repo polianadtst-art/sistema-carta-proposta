@@ -1,5 +1,5 @@
 # ============================================================================
-# ARQUIVO: app.py (Versão 4.0 — Regularize Assessoria Rural)
+# ARQUIVO: app.py (Versão 7.0 — Regularize Assessoria Rural)
 # O QUE ESTE ARQUIVO FAZ:
 #   Sistema web multiusuário em Português do Brasil (PT-BR) conectado ao
 #   PostgreSQL (Supabase), com:
@@ -20,9 +20,12 @@
 #   - Para alterar senha do banco ou usuários: edite Settings -> Secrets no Streamlit
 # ============================================================================
 
+import hashlib
+import hmac
 import io
 import json
 import re
+import secrets
 import urllib.request
 from datetime import date
 
@@ -31,6 +34,7 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 
 from config import (
+    ADMIN_EMAILS_PADRAO,
     BANCOS_PADRAO,
     CARENCIAS_PADRAO,
     CATALOGO_SERVICOS,
@@ -41,14 +45,17 @@ from config import (
     DOCUMENTOS_CLIENTE_PADRAO,
     EMPRESA,
     FAIXAS_HONORARIOS,
+    MUNICIPIOS_BANCOS_150KM_DIVINO,
     PACOTES_BANCOS,
+    PERFIS_AUTORIZACAO,
+    PERMISSOES_DESCRICAO,
     TAXA_HONORARIO_CHEIA,
     TIPOS_CLIENTE_PADRAO,
     TIPOS_CREDITO_PESSOAL_PADRAO,
     TIPOS_ENVIO_PADRAO,
     TODOS_OS_DOCUMENTOS,
 )
-from pdf_generator import fmt_cep, fmt_doc, fmt_moeda, gerar_pdf_bytes
+from pdf_generator import fmt_cep, fmt_doc, fmt_moeda, fmt_pct_br, gerar_pdf_bytes
 
 # ============================================================================
 # 1. CONFIGURAÇÃO DA PÁGINA (PORTUGUÊS DO BRASIL)
@@ -87,6 +94,7 @@ def conectar_banco():
     try:
         with eng.begin() as conn:
             conn.execute(text("ALTER TABLE propostas ADD COLUMN IF NOT EXISTS parecer_agencia TEXT DEFAULT ''"))
+            conn.execute(text("ALTER TABLE propostas ADD COLUMN IF NOT EXISTS banco_municipio VARCHAR(120) DEFAULT ''"))
             conn.execute(text("ALTER TABLE propostas ADD COLUMN IF NOT EXISTS valor_cheio_os NUMERIC(15,2) DEFAULT 0"))
             conn.execute(text("ALTER TABLE propostas ADD COLUMN IF NOT EXISTS desconto_faixa NUMERIC(15,2) DEFAULT 0"))
             conn.execute(text("ALTER TABLE propostas ADD COLUMN IF NOT EXISTS desconto_extra NUMERIC(15,2) DEFAULT 0"))
@@ -94,6 +102,20 @@ def conectar_banco():
                 "INSERT INTO aux_listas_gerais (categoria, valor) VALUES ('CARENCIA', 'SIM (1 ano)') "
                 "ON CONFLICT (categoria, valor) DO NOTHING"
             ))
+            # Tabela de Usuários e Autorizações (gerenciada pelo Admin dentro do sistema)
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS usuarios_sistema (
+                    email VARCHAR(180) PRIMARY KEY,
+                    nome VARCHAR(180) NOT NULL DEFAULT '',
+                    senha_hash VARCHAR(255) NOT NULL,
+                    perfil VARCHAR(40) NOT NULL DEFAULT 'ATENDENTE',
+                    ativo BOOLEAN NOT NULL DEFAULT TRUE,
+                    permissoes JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    criado_por VARCHAR(180) DEFAULT 'sistema',
+                    criado_em TIMESTAMP DEFAULT NOW(),
+                    atualizado_em TIMESTAMP DEFAULT NOW()
+                )
+            """))
     except Exception:
         pass
 
@@ -104,11 +126,173 @@ engine = conectar_banco()
 
 
 # ============================================================================
-# 3. TELA DE LOGIN (CONTROLE DE ACESSO MULTIUSUÁRIO)
+# 3. SEGURANÇA, USUÁRIOS, AUTORIZAÇÕES E VALIDAÇÃO POR SENHA DO ADMIN
 # ============================================================================
+def gerar_hash_senha(senha_plana):
+    """Gera hash seguro (PBKDF2-HMAC-SHA256 com salt aleatório) para salvar senhas no banco."""
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", str(senha_plana).encode("utf-8"), salt.encode("utf-8"), 120000)
+    return f"pbkdf2_sha256${salt}${dk.hex()}"
+
+
+def verificar_senha_hash(senha_plana, hash_salvo):
+    """Confere a senha digitada contra o hash salvo no banco de dados."""
+    if not hash_salvo or not senha_plana:
+        return False
+    partes = str(hash_salvo).split("$")
+    if len(partes) != 3 or partes[0] != "pbkdf2_sha256":
+        return hmac.compare_digest(str(senha_plana), str(hash_salvo))
+    _, salt, hex_esperado = partes
+    dk = hashlib.pbkdf2_hmac("sha256", str(senha_plana).encode("utf-8"), salt.encode("utf-8"), 120000)
+    return hmac.compare_digest(dk.hex(), hex_esperado)
+
+
+def obter_admins_configurados():
+    """Retorna o conjunto de e-mails de administradores padrão (config.py + Secrets opcional)."""
+    admins = {e.strip().lower() for e in ADMIN_EMAILS_PADRAO}
+    extras = st.secrets.get("ADMIN_EMAILS", [])
+    if isinstance(extras, str):
+        admins.update(x.strip().lower() for x in extras.split(",") if x.strip())
+    elif isinstance(extras, (list, tuple)):
+        admins.update(str(x).strip().lower() for x in extras if str(x).strip())
+    return admins
+
+
+def sincronizar_usuarios_iniciais():
+    """
+    Importa automaticamente (uma única vez, sem sobrescrever) os usuários que já
+    estavam cadastrados nos Secrets do Streamlit para a tabela usuarios_sistema.
+    Assim, nenhum usuário atual perde o acesso e o Admin já pode gerenciar todos na Aba 6!
+    """
+    admins = obter_admins_configurados()
+    usuarios_secrets = dict(st.secrets.get("usuarios", {}))
+    if not usuarios_secrets:
+        return
+    try:
+        with engine.begin() as conn:
+            for email_raw, senha_raw in usuarios_secrets.items():
+                email = str(email_raw).strip().lower()
+                if not email:
+                    continue
+                eh_admin = email in admins
+                perfil = "ADMIN" if eh_admin else "ATENDENTE"
+                perms = dict(PERFIS_AUTORIZACAO[perfil]["permissoes"])
+                nome_padrao = email.split("@")[0].replace(".", " ").title()
+                conn.execute(
+                    text("""
+                        INSERT INTO usuarios_sistema (email, nome, senha_hash, perfil, ativo, permissoes, criado_por)
+                        VALUES (:email, :nome, :shash, :perfil, TRUE, CAST(:perms AS jsonb), 'migracao_secrets')
+                        ON CONFLICT (email) DO NOTHING
+                    """),
+                    {
+                        "email": email,
+                        "nome": nome_padrao,
+                        "shash": gerar_hash_senha(str(senha_raw)),
+                        "perfil": perfil,
+                        "perms": json.dumps(perms, ensure_ascii=False),
+                    },
+                )
+    except Exception:
+        pass
+
+
+def carregar_usuario_db(email):
+    """Busca dados e autorizações atualizadas do usuário no PostgreSQL."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT email, nome, senha_hash, perfil, ativo, permissoes
+                FROM usuarios_sistema
+                WHERE LOWER(email) = :e
+            """),
+            {"e": str(email).strip().lower()},
+        ).mappings().first()
+    if not row:
+        return None
+    perms = dict(PERFIS_AUTORIZACAO.get(row["perfil"], PERFIS_AUTORIZACAO["ATENDENTE"])["permissoes"])
+    if isinstance(row["permissoes"], dict):
+        perms.update({k: bool(v) for k, v in row["permissoes"].items()})
+    return {
+        "email": row["email"].strip().lower(),
+        "nome": row["nome"] or row["email"].split("@")[0].title(),
+        "senha_hash": row["senha_hash"],
+        "perfil": row["perfil"],
+        "ativo": bool(row["ativo"]),
+        "permissoes": perms,
+    }
+
+
+def validar_senha_admin(senha_digitada):
+    """
+    Confirma se a senha informada pertence a um Administrador ativo (ou à SENHA_ADMIN
+    nos Secrets, caso configurada). Apenas com esta validação o sistema permite
+    adicionar usuários, alterar autorizações ou liberar descontos restritos!
+    """
+    if not senha_digitada:
+        return False
+
+    # 1. Senha mestra opcional nos Secrets (SENHA_ADMIN = "...")
+    senha_mestra = st.secrets.get("SENHA_ADMIN", "")
+    if senha_mestra and hmac.compare_digest(str(senha_digitada), str(senha_mestra)):
+        return True
+
+    # 2. Senha de qualquer Administrador ativo na tabela usuarios_sistema
+    try:
+        with engine.connect() as conn:
+            admins_db = conn.execute(
+                text("""
+                    SELECT email, senha_hash, perfil, permissoes
+                    FROM usuarios_sistema
+                    WHERE ativo = TRUE
+                      AND (perfil = 'ADMIN' OR COALESCE((permissoes->>'gerenciar_usuarios')::boolean, FALSE) = TRUE)
+                """)
+            ).mappings().all()
+        for adm in admins_db:
+            if verificar_senha_hash(senha_digitada, adm["senha_hash"]):
+                return True
+    except Exception:
+        pass
+
+    # 3. Fallback: senha do e-mail Admin cadastrado nos Secrets
+    admins_padrao = obter_admins_configurados()
+    usuarios_secrets = {k.strip().lower(): str(v) for k, v in dict(st.secrets.get("usuarios", {})).items()}
+    for e_adm in admins_padrao:
+        if e_adm in usuarios_secrets and hmac.compare_digest(str(senha_digitada), usuarios_secrets[e_adm]):
+            return True
+
+    return False
+
+
+def tem_permissao(chave):
+    """Verifica se o usuário logado possui determinada autorização."""
+    perms = st.session_state.get("usuario_permissoes") or {}
+    if st.session_state.get("usuario_perfil") == "ADMIN":
+        return True
+    return bool(perms.get(chave, False))
+
+
+def pode_dar_desconto_os():
+    """Verdadeiro se o usuário tem autorização de desconto OU se o Admin liberou por senha nesta proposta."""
+    return tem_permissao("aplicar_desconto_os") or bool(st.session_state.get("desconto_liberado_por_admin", False))
+
+
 def verificar_login():
-    """Exibe a tela de login protegida por usuário e senha."""
+    """Autentica o usuário na tabela usuarios_sistema (com sincronização automática dos Secrets)."""
+    if not st.session_state.get("_usuarios_sincronizados"):
+        sincronizar_usuarios_iniciais()
+        st.session_state["_usuarios_sincronizados"] = True
+
     if st.session_state.get("usuario_logado"):
+        # Atualiza as permissões ao vivo a cada interação (se o Admin revogar/liberar, vale na hora!)
+        u_live = carregar_usuario_db(st.session_state["usuario_logado"])
+        if u_live:
+            if not u_live["ativo"]:
+                st.session_state.clear()
+                st.error("⛔ Seu acesso foi desativado pelo Administrador.")
+                st.stop()
+            st.session_state["usuario_nome"] = u_live["nome"]
+            st.session_state["usuario_perfil"] = u_live["perfil"]
+            st.session_state["usuario_permissoes"] = u_live["permissoes"]
         return st.session_state["usuario_logado"]
 
     st.markdown(f"## 🌱 {EMPRESA['nome_fantasia']}")
@@ -123,13 +307,32 @@ def verificar_login():
             entrar = st.form_submit_button("Entrar no Sistema", use_container_width=True)
 
             if entrar:
-                usuarios_permitidos = dict(st.secrets.get("usuarios", {}))
-                mapa_lower = {k.strip().lower(): str(v) for k, v in usuarios_permitidos.items()}
-                if email in mapa_lower and senha == mapa_lower[email]:
-                    st.session_state["usuario_logado"] = email
-                    st.rerun()
+                u_db = carregar_usuario_db(email)
+                if u_db is not None:
+                    if not u_db["ativo"]:
+                        st.error("⛔ Usuário desativado. Solicite a liberação ao Administrador.")
+                    elif verificar_senha_hash(senha, u_db["senha_hash"]):
+                        st.session_state["usuario_logado"] = u_db["email"]
+                        st.session_state["usuario_nome"] = u_db["nome"]
+                        st.session_state["usuario_perfil"] = u_db["perfil"]
+                        st.session_state["usuario_permissoes"] = u_db["permissoes"]
+                        st.rerun()
+                    else:
+                        st.error("E-mail ou senha incorretos. Verifique com a administração.")
                 else:
-                    st.error("E-mail ou senha incorretos. Verifique com a administração.")
+                    # Fallback caso um novo usuário tenha sido colado apenas nos Secrets
+                    usuarios_permitidos = dict(st.secrets.get("usuarios", {}))
+                    mapa_lower = {k.strip().lower(): str(v) for k, v in usuarios_permitidos.items()}
+                    if email in mapa_lower and senha == mapa_lower[email]:
+                        eh_adm = email in obter_admins_configurados()
+                        perf = "ADMIN" if eh_adm else "ATENDENTE"
+                        st.session_state["usuario_logado"] = email
+                        st.session_state["usuario_nome"] = email.split("@")[0].title()
+                        st.session_state["usuario_perfil"] = perf
+                        st.session_state["usuario_permissoes"] = dict(PERFIS_AUTORIZACAO[perf]["permissoes"])
+                        st.rerun()
+                    else:
+                        st.error("E-mail ou senha incorretos. Verifique com a administração.")
     st.stop()
 
 
@@ -282,12 +485,12 @@ def carregar_listas_auxiliares():
 
 
 def _propriedade_vazia():
-    """Campos numéricos começam como None (100% em branco na tela e no PDF)."""
+    """Na Análise Produtiva, valores de venda iniciam em 0.0 (R$ 0,00) para somar ao final."""
     return {
         "nome": "", "matricula": "", "num_pes": None, "espacamento": "",
         "variedades": "", "idade": "", "prev_2027": "",
         "prod_2026": "", "prod_2025": "", "prod_2024": "",
-        "venda_2026": None, "venda_2025": None, "venda_2024": None,
+        "venda_2026": 0.0, "venda_2025": 0.0, "venda_2024": 0.0,
     }
 
 
@@ -296,10 +499,14 @@ def inicializar_estado_proposta():
     primeiro_serv = "PRONAF - CUSTEIO AGRÍCOLA"
     padrao = {
         "proposta_id_edicao": None,
+        "proposta_criado_por": None,
+        "desconto_liberado_por_admin": False,
         "local_emissao": EMPRESA["cidade_padrao"],
         "data_proposta": date.today(),
         "parceiro": EMPRESA["nome_fantasia"],
         "banco_destino": "",
+        "banco_municipio": "",
+        "banco_municipio_custom": "",
         "cliente_cpf": "",
         "cliente_nome": "",
         "cliente_telefone": "",
@@ -334,6 +541,7 @@ def inicializar_estado_proposta():
         "conjuge_avalista_nome": "",
         "conjuge_avalista_cpf": "",
         "credito_tipo": "",
+        "credito_modalidades": [],
         "credito_valor": None,
         "beneficio_valor": None,
         "parcela_consorcio": None,
@@ -342,13 +550,13 @@ def inicializar_estado_proposta():
         "checklist_docs": {},
         "propriedades_lista": [_propriedade_vazia()],
         "semoventes": {
-            "vacas_leite": None, "litros_dia": None, "preco_litro": None,
+            "vacas_leite": None, "litros_dia": None, "preco_litro": 0.0,
             "boi_corte": None, "novilhas": None, "bezerros": None,
         },
         "renda_extra_1_desc": "",
-        "renda_extra_1_val": None,
+        "renda_extra_1_val": 0.0,
         "renda_extra_2_desc": "",
-        "renda_extra_2_val": None,
+        "renda_extra_2_val": 0.0,
         "bens": "",
     }
     for k, v in padrao.items():
@@ -393,7 +601,7 @@ def cb_buscar_cep():
 
 
 def cb_limpar_formulario():
-    chaves_manter = {"usuario_logado"}
+    chaves_manter = {"usuario_logado", "usuario_nome", "usuario_perfil", "usuario_permissoes", "_usuarios_sincronizados"}
     for k in list(st.session_state.keys()):
         if k not in chaves_manter:
             del st.session_state[k]
@@ -499,10 +707,14 @@ def cb_carregar_proposta(proposta_id):
 
     cb_carregar_cliente(row["cliente_cpf_cnpj"])
     st.session_state["proposta_id_edicao"] = row["id"]
+    st.session_state["proposta_criado_por"] = row.get("criado_por") or ""
+    st.session_state["desconto_liberado_por_admin"] = False
     st.session_state["data_proposta"] = row["data_proposta"]
     st.session_state["local_emissao"] = row["local_emissao"] or EMPRESA["cidade_padrao"]
     st.session_state["parceiro"] = row["parceiro"] or EMPRESA["nome_fantasia"]
     st.session_state["banco_destino"] = row["banco_destino"] or ""
+    st.session_state["banco_municipio"] = row.get("banco_municipio") or ""
+    st.session_state["banco_municipio_custom"] = ""
     st.session_state["imovel_beneficiado_texto"] = row["imovel_beneficiado_texto"] or ""
     st.session_state["filtro_linha_credito"] = "TODAS AS LINHAS"
     st.session_state["tipo_servico"] = row["tipo_servico"] or ""
@@ -522,7 +734,10 @@ def cb_carregar_proposta(proposta_id):
     st.session_state["avalista_cpf"] = fmt_doc(row["avalista_cpf"] or "")
     st.session_state["conjuge_avalista_nome"] = row["conjuge_avalista_nome"] or ""
     st.session_state["conjuge_avalista_cpf"] = fmt_doc(row["conjuge_avalista_cpf"] or "")
-    st.session_state["credito_tipo"] = row["credito_tipo"] or ""
+    cred_str = row["credito_tipo"] or ""
+    st.session_state["credito_tipo"] = cred_str
+    mods_lidas = [m.strip().upper() for m in cred_str.split(",") if m.strip()]
+    st.session_state["credito_modalidades"] = [m for m in TIPOS_CREDITO_PESSOAL_PADRAO if m in mods_lidas]
     st.session_state["credito_valor"] = num_float_ou_none(row["credito_valor"])
     st.session_state["beneficio_valor"] = num_float_ou_none(row["beneficio_valor"])
     st.session_state["parcela_consorcio"] = num_float_ou_none(row["parcela_consorcio"])
@@ -537,9 +752,9 @@ def cb_carregar_proposta(proposta_id):
             pc = _propriedade_vazia()
             pc.update(p)
             pc["num_pes"] = num_int_ou_none(pc.get("num_pes"))
-            pc["venda_2026"] = num_float_ou_none(pc.get("venda_2026"))
-            pc["venda_2025"] = num_float_ou_none(pc.get("venda_2025"))
-            pc["venda_2024"] = num_float_ou_none(pc.get("venda_2024"))
+            pc["venda_2026"] = float(pc.get("venda_2026") or 0.0)
+            pc["venda_2025"] = float(pc.get("venda_2025") or 0.0)
+            pc["venda_2024"] = float(pc.get("venda_2024") or 0.0)
             props_limpas.append(pc)
         st.session_state["propriedades_lista"] = props_limpas
     if prod.get("semoventes"):
@@ -547,15 +762,15 @@ def cb_carregar_proposta(proposta_id):
         st.session_state["semoventes"] = {
             "vacas_leite": num_int_ou_none(s_raw.get("vacas_leite")),
             "litros_dia": num_float_ou_none(s_raw.get("litros_dia")),
-            "preco_litro": num_float_ou_none(s_raw.get("preco_litro")),
+            "preco_litro": float(s_raw.get("preco_litro") or 0.0),
             "boi_corte": num_int_ou_none(s_raw.get("boi_corte")),
             "novilhas": num_int_ou_none(s_raw.get("novilhas")),
             "bezerros": num_int_ou_none(s_raw.get("bezerros")),
         }
     st.session_state["renda_extra_1_desc"] = prod.get("renda_extra_1_desc", "")
-    st.session_state["renda_extra_1_val"] = num_float_ou_none(prod.get("renda_extra_1_val"))
+    st.session_state["renda_extra_1_val"] = float(prod.get("renda_extra_1_val") or 0.0)
     st.session_state["renda_extra_2_desc"] = prod.get("renda_extra_2_desc", "")
-    st.session_state["renda_extra_2_val"] = num_float_ou_none(prod.get("renda_extra_2_val"))
+    st.session_state["renda_extra_2_val"] = float(prod.get("renda_extra_2_val") or 0.0)
     st.session_state["bens"] = prod.get("bens", "")
 
 
@@ -596,11 +811,21 @@ def montar_dicionario_proposta():
     else:
         item_final = item_sel
 
+    mun_banco_sel = st.session_state.get("banco_municipio", "")
+    if mun_banco_sel == "OUTRO MUNICÍPIO (DIGITAR MANUALMENTE)":
+        banco_municipio_final = st.session_state.get("banco_municipio_custom", "").strip()
+    else:
+        banco_municipio_final = mun_banco_sel
+
+    mods_sel = st.session_state.get("credito_modalidades") or []
+    credito_tipo_final = ", ".join(mods_sel) if mods_sel else st.session_state.get("credito_tipo", "")
+
     return {
         "local_emissao": st.session_state["local_emissao"],
         "data_proposta": st.session_state["data_proposta"],
         "parceiro": st.session_state["parceiro"],
         "banco_destino": st.session_state["banco_destino"],
+        "banco_municipio": banco_municipio_final,
         "cliente_cpf": apenas_digitos(st.session_state["cliente_cpf"]),
         "cliente_nome": st.session_state["cliente_nome"].strip().upper(),
         "cliente_telefone": st.session_state["cliente_telefone"],
@@ -639,7 +864,7 @@ def montar_dicionario_proposta():
         "avalista_cpf": apenas_digitos(st.session_state["avalista_cpf"]),
         "conjuge_avalista_nome": st.session_state["conjuge_avalista_nome"].strip().upper(),
         "conjuge_avalista_cpf": apenas_digitos(st.session_state["conjuge_avalista_cpf"]),
-        "credito_tipo": st.session_state["credito_tipo"],
+        "credito_tipo": credito_tipo_final,
         "credito_valor": num_float_ou_none(st.session_state.get("credito_valor")),
         "beneficio_valor": num_float_ou_none(st.session_state.get("beneficio_valor")),
         "parcela_consorcio": num_float_ou_none(st.session_state.get("parcela_consorcio")),
@@ -650,17 +875,34 @@ def montar_dicionario_proposta():
             "propriedades": props,
             "semoventes": st.session_state.get("semoventes", {}),
             "renda_extra_1_desc": st.session_state.get("renda_extra_1_desc", ""),
-            "renda_extra_1_val": num_float_ou_none(st.session_state.get("renda_extra_1_val")),
+            "renda_extra_1_val": float(st.session_state.get("renda_extra_1_val") or 0.0),
             "renda_extra_2_desc": st.session_state.get("renda_extra_2_desc", ""),
-            "renda_extra_2_val": num_float_ou_none(st.session_state.get("renda_extra_2_val")),
+            "renda_extra_2_val": float(st.session_state.get("renda_extra_2_val") or 0.0),
             "bens": st.session_state.get("bens", ""),
         },
-        "renda_bruta_anual": renda_bruta if renda_bruta > 0 else None,
+        "soma_vendas_2026": round(soma_vendas, 2),
+        "soma_rendas_extras": round(float(st.session_state.get("renda_extra_1_val") or 0.0) + float(st.session_state.get("renda_extra_2_val") or 0.0), 2),
+        "renda_bruta_anual": round(renda_bruta, 2),
     }
 
 
 def salvar_tudo_no_banco():
-    """Salva Cliente, Propriedades e Proposta de forma atômica no PostgreSQL."""
+    """Salva Cliente, Propriedades e Proposta de forma atômica no PostgreSQL (validando autorizações)."""
+    if not tem_permissao("criar_editar_proposta"):
+        st.error("⛔ Seu usuário tem autorização apenas de consulta. Solicite ao Administrador para liberar gravação.")
+        return None
+
+    pid_edit_check = st.session_state.get("proposta_id_edicao")
+    dono_prop = str(st.session_state.get("proposta_criado_por") or "").strip().lower()
+    if pid_edit_check and dono_prop and dono_prop != usuario_atual and not tem_permissao("editar_proposta_outros"):
+        st.error(f"⛔ Esta proposta pertence a '{dono_prop}'. Você não tem autorização para editar propostas de outros atendentes.")
+        return None
+
+    # Se o usuário não tem autorização de desconto e o Admin não liberou nesta proposta, trava em 2,00%
+    if not pode_dar_desconto_os():
+        st.session_state["faixa_honorario_idx"] = 2
+        st.session_state["desconto_extra"] = None
+
     d = montar_dicionario_proposta()
     if len(d["cliente_cpf"]) not in (11, 14):
         st.error("❌ Informe um CPF (11 números) ou CNPJ (14 números) válido antes de salvar.")
@@ -748,6 +990,7 @@ def salvar_tudo_no_banco():
             "local_emissao": d["local_emissao"],
             "parceiro": d["parceiro"],
             "banco_destino": d["banco_destino"],
+            "banco_municipio": d["banco_municipio"],
             "cliente_cpf_cnpj": d["cliente_cpf"],
             "propriedade_beneficiada_id": prop_benef_id,
             "imovel_beneficiado_texto": d["imovel_beneficiado_texto"],
@@ -795,6 +1038,7 @@ def salvar_tudo_no_banco():
                     UPDATE propostas SET
                         data_proposta = :data_proposta, local_emissao = :local_emissao,
                         parceiro = :parceiro, banco_destino = :banco_destino,
+                        banco_municipio = :banco_municipio,
                         cliente_cpf_cnpj = :cliente_cpf_cnpj,
                         propriedade_beneficiada_id = :propriedade_beneficiada_id,
                         imovel_beneficiado_texto = :imovel_beneficiado_texto,
@@ -832,7 +1076,7 @@ def salvar_tudo_no_banco():
             novo_id = conn.execute(
                 text("""
                     INSERT INTO propostas (
-                        data_proposta, local_emissao, parceiro, banco_destino,
+                        data_proposta, local_emissao, parceiro, banco_destino, banco_municipio,
                         cliente_cpf_cnpj, propriedade_beneficiada_id, imovel_beneficiado_texto,
                         tipo_servico, descricao_servico, item_financiado, cultura, carencia,
                         valor_proposto, tipo_envio_docs, data_envio_docs,
@@ -845,7 +1089,7 @@ def salvar_tudo_no_banco():
                         parcela_consorcio, num_parcelas_consorcio, parecer_agencia,
                         checklist_docs, dados_producao, renda_bruta_anual, criado_por
                     ) VALUES (
-                        :data_proposta, :local_emissao, :parceiro, :banco_destino,
+                        :data_proposta, :local_emissao, :parceiro, :banco_destino, :banco_municipio,
                         :cliente_cpf_cnpj, :propriedade_beneficiada_id, :imovel_beneficiado_texto,
                         :tipo_servico, :descricao_servico, :item_financiado, :cultura, :carencia,
                         :valor_proposto, :tipo_envio_docs, :data_envio_docs,
@@ -874,7 +1118,11 @@ catalogo_servicos, listas_cat, df_contabilidades = carregar_listas_auxiliares()
 
 with st.sidebar:
     st.markdown(f"### 🌱 {EMPRESA['nome_fantasia']}")
-    st.caption(f"👤 Atendente: **{usuario_atual}**")
+    nome_exib_user = st.session_state.get("usuario_nome") or usuario_atual
+    perfil_exib_user = st.session_state.get("usuario_perfil", "ATENDENTE")
+    st.caption(f"👤 **{nome_exib_user}** ({usuario_atual})")
+    st.caption(f"🛡️ Perfil: **{perfil_exib_user}**")
+
     if st.session_state.get("proposta_id_edicao"):
         st.info(f"✏️ Editando Proposta **#{st.session_state['proposta_id_edicao']}**")
     else:
@@ -882,10 +1130,13 @@ with st.sidebar:
 
     st.button("🆕 Limpar / Nova Proposta", on_click=cb_limpar_formulario, use_container_width=True)
 
-    if st.button("💾 Salvar Proposta Agora", type="primary", use_container_width=True):
-        pid = salvar_tudo_no_banco()
-        if pid:
-            st.success(f"✅ Proposta #{pid} salva com sucesso!")
+    if tem_permissao("criar_editar_proposta"):
+        if st.button("💾 Salvar Proposta Agora", type="primary", use_container_width=True):
+            pid = salvar_tudo_no_banco()
+            if pid:
+                st.success(f"✅ Proposta #{pid} salva com sucesso!")
+    else:
+        st.warning("🔒 Modo Somente Consulta")
 
     st.divider()
     if st.button("🚪 Sair do Sistema", use_container_width=True):
@@ -895,14 +1146,22 @@ with st.sidebar:
 
 # ============================================================================
 # 8. ABAS PRINCIPAIS DO SISTEMA (100% PORTUGUÊS DO BRASIL)
+#    A Aba 6 (Administração) só aparece para Administradores autorizados!
 # ============================================================================
-aba1, aba2, aba3, aba4, aba5 = st.tabs([
+titulos_abas = [
     "📋 1. Nova Proposta & Cliente",
     "🌱 2. Análise Produtiva",
     "🧾 3. Ordem de Serviço & LGPD",
     "🖨️ 4. Imprimir / PDFs (P&B)",
     "🗂️ 5. Histórico & Cadastros",
-])
+]
+eh_admin_painel = tem_permissao("gerenciar_usuarios")
+if eh_admin_painel:
+    titulos_abas.append("🔐 6. Administração (Usuários)")
+
+abas_criadas = st.tabs(titulos_abas)
+aba1, aba2, aba3, aba4, aba5 = abas_criadas[:5]
+aba6_admin = abas_criadas[5] if eh_admin_painel else None
 
 # ----------------------------------------------------------------------------
 # ABA 1: NOVA PROPOSTA & CADASTRO DO CLIENTE
@@ -945,14 +1204,28 @@ with aba1:
     st.divider()
     st.subheader("📄 Dados da Proposta e do Produtor")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns([1.2, 1.0, 1.8])
     c1.text_input("Local de Emissão", key="local_emissao")
     c2.date_input("Data da Proposta", key="data_proposta", format="DD/MM/YYYY")
     c3.text_input("Parceiro / Escritório", key="parceiro")
+
+    b1, b2 = st.columns([1.4, 2.6])
     bancos_lista = [""] + listas_cat["BANCO"]
     if st.session_state["banco_destino"] not in bancos_lista:
         bancos_lista.append(st.session_state["banco_destino"])
-    c4.selectbox("Banco Destino", bancos_lista, key="banco_destino")
+    b1.selectbox("Banco / Cooperativa de Destino", bancos_lista, key="banco_destino")
+
+    opcoes_mun_banco = [""] + MUNICIPIOS_BANCOS_150KM_DIVINO + ["OUTRO MUNICÍPIO (DIGITAR MANUALMENTE)"]
+    if st.session_state["banco_municipio"] not in opcoes_mun_banco:
+        opcoes_mun_banco.insert(1, st.session_state["banco_municipio"])
+    b2.selectbox(
+        "Município do Banco / Cooperativa (raio de 150 km de Divino - MG)",
+        opcoes_mun_banco,
+        key="banco_municipio",
+        help="Digite o nome da cidade para buscar rapidamente entre os 182 municípios de MG, ES e RJ num raio de 150 km de Divino - MG.",
+    )
+    if st.session_state["banco_municipio"] == "OUTRO MUNICÍPIO (DIGITAR MANUALMENTE)":
+        b2.text_input("Digite o Município e UF do Banco / Cooperativa:", key="banco_municipio_custom", placeholder="Ex.: Juiz de Fora - MG")
 
     p1, p2, p3, p4 = st.columns([2.2, 1.4, 1.2, 1.2])
     p1.text_input("Nome Completo do Produtor *", key="cliente_nome")
@@ -1101,17 +1374,37 @@ with aba1:
 
     with col_margem:
         st.markdown("#### 💳 Margem Crédito Pessoal e Consórcio")
-        m1, m2 = st.columns(2)
-        lista_tc_cred = [""] + listas_cat["TIPO_CREDITO"]
-        if st.session_state["credito_tipo"] not in lista_tc_cred:
-            lista_tc_cred.append(st.session_state["credito_tipo"])
-        m1.selectbox("Tipo de Crédito Pessoal", lista_tc_cred, key="credito_tipo")
-        m2.number_input("Valor do Crédito (R$)", min_value=0.0, step=100.0, format="%.2f", key="credito_valor", placeholder="")
-
+        st.multiselect(
+            "Modalidade (marca com X no PDF — deixe vazio para marcar à mão na impressão)",
+            options=TIPOS_CREDITO_PESSOAL_PADRAO,
+            key="credito_modalidades",
+            placeholder="Selecione se desejar marcar automaticamente no PDF",
+        )
+        st.number_input(
+            "Valor (R$)",
+            min_value=0.0,
+            step=100.0,
+            format="%.2f",
+            key="credito_valor",
+            placeholder="",
+        )
+        st.caption("**Consórcio:**")
         m3, m4 = st.columns(2)
-        m3.number_input("Valor do Benefício (R$)", min_value=0.0, step=100.0, format="%.2f", key="beneficio_valor", placeholder="")
-        m4.number_input("Parcela Consórcio (R$)", min_value=0.0, step=100.0, format="%.2f", key="parcela_consorcio", placeholder="")
-        st.number_input("Nº de Parcelas do Consórcio", min_value=0, step=1, key="num_parcelas_consorcio", placeholder="")
+        m3.number_input(
+            "Valor da Parcela do Consórcio (R$)",
+            min_value=0.0,
+            step=50.0,
+            format="%.2f",
+            key="parcela_consorcio",
+            placeholder="",
+        )
+        m4.number_input(
+            "Quantidade de Parcelas do Consórcio",
+            min_value=0,
+            step=1,
+            key="num_parcelas_consorcio",
+            placeholder="",
+        )
 
     with col_aval:
         st.markdown("#### 🤝 Avalistas (Avalista e Cônjuge)")
@@ -1178,9 +1471,9 @@ with aba2:
             p["prod_2024"] = r3c3.text_input("Produção 2024", value=p.get("prod_2024", ""), key=f"p_p24_{idx}")
 
             r4c1, r4c2, r4c3 = st.columns(3)
-            p["venda_2026"] = r4c1.number_input("Valor de Venda 2026 (R$)", min_value=0.0, step=500.0, value=num_float_ou_none(p.get("venda_2026")), key=f"p_v26_{idx}", format="%.2f", placeholder="")
-            p["venda_2025"] = r4c2.number_input("Valor de Venda 2025 (R$)", min_value=0.0, step=500.0, value=num_float_ou_none(p.get("venda_2025")), key=f"p_v25_{idx}", format="%.2f", placeholder="")
-            p["venda_2024"] = r4c3.number_input("Valor de Venda 2024 (R$)", min_value=0.0, step=500.0, value=num_float_ou_none(p.get("venda_2024")), key=f"p_v24_{idx}", format="%.2f", placeholder="")
+            p["venda_2026"] = r4c1.number_input("Valor de Venda 2026 (R$)", min_value=0.0, step=500.0, value=float(p.get("venda_2026") or 0.0), key=f"p_v26_{idx}", format="%.2f")
+            p["venda_2025"] = r4c2.number_input("Valor de Venda 2025 (R$)", min_value=0.0, step=500.0, value=float(p.get("venda_2025") or 0.0), key=f"p_v25_{idx}", format="%.2f")
+            p["venda_2024"] = r4c3.number_input("Valor de Venda 2024 (R$)", min_value=0.0, step=500.0, value=float(p.get("venda_2024") or 0.0), key=f"p_v24_{idx}", format="%.2f")
 
     st.divider()
     st.markdown("#### 🐄 Semoventes, Renda Extra e Bens")
@@ -1188,7 +1481,7 @@ with aba2:
     s1, s2, s3 = st.columns(3)
     sem["vacas_leite"] = s1.number_input("Vacas de Leite (qtd)", min_value=0, step=1, value=num_int_ou_none(sem.get("vacas_leite")), placeholder="")
     sem["litros_dia"] = s2.number_input("Litros por Dia", min_value=0.0, step=5.0, value=num_float_ou_none(sem.get("litros_dia")), placeholder="")
-    sem["preco_litro"] = s3.number_input("Preço por Litro (R$)", min_value=0.0, step=0.10, value=num_float_ou_none(sem.get("preco_litro")), format="%.2f", placeholder="")
+    sem["preco_litro"] = s3.number_input("Preço por Litro (R$)", min_value=0.0, step=0.10, value=float(sem.get("preco_litro") or 0.0), format="%.2f")
 
     s4, s5, s6 = st.columns(3)
     sem["boi_corte"] = s4.number_input("Boi de Corte (qtd)", min_value=0, step=1, value=num_int_ou_none(sem.get("boi_corte")), placeholder="")
@@ -1197,24 +1490,29 @@ with aba2:
 
     re1, re2, re3, re4 = st.columns([2, 1, 2, 1])
     re1.text_input("Renda Extra 1 (Descrição)", key="renda_extra_1_desc")
-    re2.number_input("Valor Renda 1 (R$)", min_value=0.0, step=500.0, format="%.2f", key="renda_extra_1_val", placeholder="")
+    re2.number_input("Valor Renda 1 (R$)", min_value=0.0, step=500.0, format="%.2f", key="renda_extra_1_val")
     re3.text_input("Renda Extra 2 (Descrição)", key="renda_extra_2_desc")
-    re4.number_input("Valor Renda 2 (R$)", min_value=0.0, step=500.0, format="%.2f", key="renda_extra_2_val", placeholder="")
+    re4.number_input("Valor Renda 2 (R$)", min_value=0.0, step=500.0, format="%.2f", key="renda_extra_2_val")
 
     st.text_area("Relação de Bens (máquinas, veículos, benfeitorias)", key="bens", height=80)
 
     resumo_prod = montar_dicionario_proposta()
-    st.metric("💵 Renda Bruta Anual Calculada", fmt_moeda(resumo_prod["renda_bruta_anual"]) or " ")
+    with st.container(border=True):
+        st.markdown("#### 💵 Resumo da Renda Bruta Anual (Sai somado na impressão)")
+        rp1, rp2, rp3 = st.columns(3)
+        rp1.markdown(f"**Soma Vendas 2026 (Propriedades):**\n\n### {fmt_moeda(resumo_prod['soma_vendas_2026'], vazio_se_zero=False)}")
+        rp2.markdown(f"**Soma Rendas Extras:**\n\n### {fmt_moeda(resumo_prod['soma_rendas_extras'], vazio_se_zero=False)}")
+        rp3.markdown(f"**RENDA BRUTA ANUAL TOTAL:**\n\n### {fmt_moeda(resumo_prod['renda_bruta_anual'], vazio_se_zero=False)}")
 
 
 # ----------------------------------------------------------------------------
 # ABA 3: ORDEM DE SERVIÇO & LGPD (SEM GOV.BR + COOPERATIVAS DE CRÉDITO)
 # ----------------------------------------------------------------------------
 with aba3:
-    st.subheader("🧾 Ordem de Serviço — Valor Cheio (2,00%) e Desconto Concedido")
+    st.subheader("🧾 Ordem de Serviço")
     st.caption(
-        "Na impressão da Ordem de Serviço, o sistema exibe o Valor Cheio (2,00%) nos honorários e destaca "
-        "no campo Desconto a redução concedida pela faixa escolhida abaixo."
+        "Configure abaixo a faixa de honorários, eventuais descontos ou acréscimos e a forma de pagamento. "
+        "Na impressão, o cliente verá apenas o Subtotal, a porcentagem de Desconto concedida e o Total a Pagar."
     )
 
     st.text_area(
@@ -1223,38 +1521,84 @@ with aba3:
         height=95,
     )
 
-    os1, os2, os3, os4 = st.columns([2.0, 1.0, 1.0, 0.9])
+    liberado_desconto = pode_dar_desconto_os()
+    if not liberado_desconto:
+        st.session_state["faixa_honorario_idx"] = 2
+        st.session_state["desconto_extra"] = None
+
+    os1, os2, os3 = st.columns([2.2, 1.1, 1.1])
     opcoes_faixa_chaves = list(FAIXAS_HONORARIOS.keys())
     os1.selectbox(
-        "Faixa de Honorários (Define o Desconto sobre 2,00%)",
+        "Faixa de Honorários (Define a porcentagem de desconto)",
         options=opcoes_faixa_chaves,
         format_func=lambda k: FAIXAS_HONORARIOS[k]["rotulo"],
         key="faixa_honorario_idx",
+        disabled=not liberado_desconto,
     )
-    os2.number_input("Desconto Extra Manual (R$)", min_value=0.0, step=100.0, format="%.2f", key="desconto_extra", placeholder="")
+    os2.number_input(
+        "Desconto Extra Manual (R$)",
+        min_value=0.0,
+        step=100.0,
+        format="%.2f",
+        key="desconto_extra",
+        placeholder="",
+        disabled=not liberado_desconto,
+    )
     os3.number_input("Acréscimos (R$)", min_value=0.0, step=100.0, format="%.2f", key="acrescimos", placeholder="")
-    os4.number_input("Nº de Parcelas", min_value=1, step=1, key="num_parcelas", placeholder="")
+
+    if not tem_permissao("aplicar_desconto_os"):
+        if st.session_state.get("desconto_liberado_por_admin"):
+            st.success("🔓 Desconto na Ordem de Serviço liberado pelo Administrador para esta proposta.")
+        else:
+            with st.expander("🔑 Precisa conceder desconto? Liberação pontual com senha do Administrador"):
+                with st.form("form_liberar_desconto_admin", clear_on_submit=True):
+                    senha_adm_desc = st.text_input("Senha do Administrador", type="password")
+                    if st.form_submit_button("🔓 Liberar Desconto nesta Proposta"):
+                        if validar_senha_admin(senha_adm_desc):
+                            st.session_state["desconto_liberado_por_admin"] = True
+                            st.success("✅ Desconto liberado pelo Administrador!")
+                            st.rerun()
+                        else:
+                            st.error("❌ Senha do Administrador inválida.")
 
     st.text_input("Forma de Pagamento", key="forma_pagamento")
 
+    # Painel financeiro espaçoso e bem organizado (sem cortar números!)
     d_calc = montar_dicionario_proposta()
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Valor Proposto", fmt_moeda(d_calc["valor_proposto"]) or " ")
-    k2.metric("Valor Cheio (2,00%)", fmt_moeda(d_calc["valor_cheio_os"]) or " ")
-    desc_val_txt = f"- {fmt_moeda(d_calc['desconto'])}" if d_calc["desconto"] else " "
-    k3.metric(f"Desconto Concedido ({d_calc['percentual_desconto_faixa']*100:.2f}%)", desc_val_txt)
+    val_prop_c = float(d_calc["valor_proposto"] or 0.0)
+    desc_tot_c = float(d_calc["desconto"] or 0.0)
+    if val_prop_c > 0 and desc_tot_c > 0:
+        pct_desc_vis = (desc_tot_c / val_prop_c) * 100.0 if d_calc["desconto_extra"] else (d_calc["percentual_desconto_faixa"] * 100.0)
+        txt_pct_desc_vis = fmt_pct_br(pct_desc_vis)
+    else:
+        txt_pct_desc_vis = "Sem desconto"
+
     if d_calc["valor_proposto"] and d_calc["percentual_honorario"] == 0 and not d_calc["valor_total_os"]:
         tot_txt = "ISENTO"
     else:
-        tot_txt = fmt_moeda(d_calc["valor_total_os"]) or " "
-    k4.metric("TOTAL DA OS", tot_txt)
-    rot_parc = f"{d_calc['num_parcelas']}x Parcela(s)" if d_calc["num_parcelas"] else "Parcelamento"
-    k5.metric(rot_parc, fmt_moeda(d_calc["valor_parcela"]) or " ")
+        tot_txt = fmt_moeda(d_calc["valor_total_os"]) or "—"
+
+    with st.container(border=True):
+        st.markdown("#### 💰 Resumo Financeiro da Ordem de Serviço")
+        r1a, r1b = st.columns(2)
+        r1a.markdown(f"**Valor Proposto da Operação:**\n\n### {fmt_moeda(d_calc['valor_proposto']) or '—'}")
+        r1b.markdown(f"**Subtotal (Honorários 2,00%):**\n\n### {fmt_moeda(d_calc['valor_cheio_os']) or '—'}")
+
+        st.divider()
+        r2a, r2b, r2c = st.columns(3)
+        r2a.markdown(f"**Porcentagem de Desconto (sai na OS):**\n\n#### {txt_pct_desc_vis}")
+        r2b.markdown(f"**Desconto em Reais (controle interno):**\n\n#### {('- ' + fmt_moeda(d_calc['desconto'])) if d_calc['desconto'] else '—'}")
+        r2c.markdown(f"**Acréscimos:**\n\n#### {fmt_moeda(d_calc['acrescimos']) or '—'}")
+
+        st.divider()
+        st.success(f"### ✅ TOTAL A PAGAR NA ORDEM DE SERVIÇO:  {tot_txt}")
 
     st.divider()
     st.subheader("🔒 Conferência do Termo LGPD (Proteção de Dados)")
     banco_lgpd = d_calc["banco_destino"]
-    inst_lgpd_txt = f"{banco_lgpd} (Instituições financeiras e cooperativas de crédito)" if banco_lgpd else "Instituições financeiras e cooperativas de crédito"
+    mun_lgpd = d_calc["banco_municipio"]
+    banco_lgpd_full = f"{banco_lgpd} — {mun_lgpd}" if (banco_lgpd and mun_lgpd) else (banco_lgpd or mun_lgpd)
+    inst_lgpd_txt = f"{banco_lgpd_full} (Instituições financeiras e cooperativas de crédito)" if banco_lgpd_full else "Instituições financeiras e cooperativas de crédito"
     cnpj_cont_txt = fmt_doc(d_calc["contabilidade_cnpj"])
     cont_linha = f"{d_calc['contabilidade_nome']} (CNPJ: {cnpj_cont_txt})" if (d_calc["contabilidade_nome"] and cnpj_cont_txt) else d_calc["contabilidade_nome"]
 
@@ -1264,10 +1608,13 @@ with aba3:
         f"**Instituição Financeira / Abrangência:** {inst_lgpd_txt}"
     )
 
-    if st.button("💾 Salvar Proposta e Atualizar Cadastro no Banco", type="primary", use_container_width=True):
-        pid = salvar_tudo_no_banco()
-        if pid:
-            st.success(f"✅ Proposta #{pid} salva com sucesso no PostgreSQL! Agora você pode gerar os PDFs na Aba 4.")
+    if tem_permissao("criar_editar_proposta"):
+        if st.button("💾 Salvar Proposta e Atualizar Cadastro no Banco", type="primary", use_container_width=True):
+            pid = salvar_tudo_no_banco()
+            if pid:
+                st.success(f"✅ Proposta #{pid} salva com sucesso no PostgreSQL! Agora você pode gerar os PDFs na Aba 4.")
+    else:
+        st.warning("🔒 Seu perfil é Somente Consulta. Peça ao Administrador para liberar permissão de criação/edição.")
 
 
 # ----------------------------------------------------------------------------
@@ -1275,60 +1622,65 @@ with aba3:
 # ----------------------------------------------------------------------------
 with aba4:
     st.subheader("🖨️ Impressão de Pacotes Bancários e Documentos Avulsos")
-    st.info(
-        "🖨️ **Padrão de Impressão Ativado:** Preto e Branco • Margens confortáveis (1,4 cm × 1,3 cm) • "
-        "Distribuição equilibrada em 1 folha A4 por documento • Campos vazios em branco • "
-        "Marca d'água oficial da Regularize em todas as folhas."
-    )
+    if not tem_permissao("gerar_pdf"):
+        st.warning("🔒 Seu usuário não tem autorização para gerar/imprimir PDFs. Solicite liberação ao Administrador.")
+    else:
 
-    d_pdf = montar_dicionario_proposta()
-    nome_arquivo_base = re.sub(r"[^A-Za-z0-9_-]+", "_", d_pdf["cliente_nome"] or "PROPOSTA").strip("_")
-
-    col_pac, col_ind = st.columns(2)
-
-    with col_pac:
-        st.markdown("### 📦 Pacote Completo por Instituição")
-        banco_pacote = st.selectbox("Escolha o Pacote Bancário:", list(PACOTES_BANCOS.keys()))
-        incluir_abas_cliente = st.multiselect(
-            "Quais documentos do cliente incluir no início do pacote?",
-            options=DOCUMENTOS_CLIENTE_PADRAO + ["GALPÃO DE GRÃOS"],
-            default=DOCUMENTOS_CLIENTE_PADRAO,
-        )
-        incluir_aval = st.checkbox(
-            "Incluir folhas de Avalista e Cônjuge (quando preenchidos no Banco do Brasil)",
-            value=True,
+        st.info(
+            "🖨️ **Padrão de Impressão Ativado:** Preto e Branco • Margens confortáveis (1,4 cm × 1,3 cm) • "
+            "Distribuição equilibrada em 1 folha A4 por documento • Campos vazios em branco • "
+            "Marca d'água oficial da Regularize em todas as folhas."
         )
 
-        docs_do_pacote = list(incluir_abas_cliente) + list(PACOTES_BANCOS[banco_pacote])
-        if banco_pacote == "BANCO DO BRASIL" and incluir_aval:
-            if d_pdf["avalista_nome"]:
-                docs_do_pacote.extend(["BB AVAL", "SICOR AVAL"])
-            if d_pdf["conjuge_avalista_nome"]:
-                docs_do_pacote.extend(["BB CONJUGE AVAL", "SICOR CONJUGE AVAL"])
+        d_pdf = montar_dicionario_proposta()
+        nome_arquivo_base = re.sub(r"[^A-Za-z0-9_-]+", "_", d_pdf["cliente_nome"] or "PROPOSTA").strip("_")
 
-        st.caption(f"Total de folhas A4 neste PDF: **{len(docs_do_pacote)}** (" + ", ".join(docs_do_pacote) + ")")
-        if docs_do_pacote:
-            pdf_pacote = gerar_pdf_bytes(d_pdf, docs_do_pacote)
+        col_pac, col_ind = st.columns(2)
+
+        with col_pac:
+            st.markdown("### 📦 Pacote Completo por Instituição")
+            banco_pacote = st.selectbox("Escolha o Pacote Bancário:", list(PACOTES_BANCOS.keys()))
+            incluir_abas_cliente = st.multiselect(
+                "Quais documentos do cliente incluir no início do pacote?",
+                options=DOCUMENTOS_CLIENTE_PADRAO + ["GALPÃO DE GRÃOS"],
+                default=DOCUMENTOS_CLIENTE_PADRAO,
+            )
+            incluir_aval = st.checkbox(
+                "Incluir folhas de Avalista e Cônjuge (quando preenchidos no Banco do Brasil)",
+                value=True,
+            )
+
+            docs_do_pacote = list(incluir_abas_cliente) + list(PACOTES_BANCOS[banco_pacote])
+            if banco_pacote == "BANCO DO BRASIL" and incluir_aval:
+                if d_pdf["avalista_nome"]:
+                    docs_do_pacote.extend(["BB AVAL", "SICOR AVAL"])
+                if d_pdf["conjuge_avalista_nome"]:
+                    docs_do_pacote.extend(["BB CONJUGE AVAL", "SICOR CONJUGE AVAL"])
+
+            st.caption(f"Total de folhas A4 neste PDF: **{len(docs_do_pacote)}** (" + ", ".join(docs_do_pacote) + ")")
+            if docs_do_pacote:
+                pdf_pacote = gerar_pdf_bytes(d_pdf, docs_do_pacote)
+                st.download_button(
+                    label=f"📥 Baixar Pacote PDF (P&B) — {banco_pacote}",
+                    data=pdf_pacote,
+                    file_name=f"PACOTE_{banco_pacote.replace(' ', '_')}_{nome_arquivo_base}.pdf",
+                    mime="application/pdf",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+        with col_ind:
+            st.markdown("### 📄 Documento Individual (1 Folha A4)")
+            doc_avulso = st.selectbox("Escolha qualquer um dos 23 documentos:", TODOS_OS_DOCUMENTOS)
+            pdf_avulso = gerar_pdf_bytes(d_pdf, [doc_avulso])
             st.download_button(
-                label=f"📥 Baixar Pacote PDF (P&B) — {banco_pacote}",
-                data=pdf_pacote,
-                file_name=f"PACOTE_{banco_pacote.replace(' ', '_')}_{nome_arquivo_base}.pdf",
+                label=f"📥 Baixar PDF Individual (P&B) — {doc_avulso}",
+                data=pdf_avulso,
+                file_name=f"{doc_avulso.replace(' ', '_')}_{nome_arquivo_base}.pdf",
                 mime="application/pdf",
-                type="primary",
                 use_container_width=True,
             )
 
-    with col_ind:
-        st.markdown("### 📄 Documento Individual (1 Folha A4)")
-        doc_avulso = st.selectbox("Escolha qualquer um dos 23 documentos:", TODOS_OS_DOCUMENTOS)
-        pdf_avulso = gerar_pdf_bytes(d_pdf, [doc_avulso])
-        st.download_button(
-            label=f"📥 Baixar PDF Individual (P&B) — {doc_avulso}",
-            data=pdf_avulso,
-            file_name=f"{doc_avulso.replace(' ', '_')}_{nome_arquivo_base}.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
 
 
 # ----------------------------------------------------------------------------
@@ -1341,15 +1693,20 @@ with aba5:
     banco_hist = f2.selectbox("Filtrar por Banco:", ["TODOS"] + listas_cat["BANCO"])
     limite_hist = f3.number_input("Máximo de registros", min_value=20, max_value=2000, value=200, step=50)
 
+    ver_todos = tem_permissao("ver_historico_todos")
+    if not ver_todos:
+        st.caption("🔒 Exibindo apenas as propostas criadas pelo seu usuário. (Para ver a equipe toda, solicite autorização ao Administrador).")
+
     sql_hist = text("""
         SELECT p.id, p.data_proposta, c.nome AS cliente, p.cliente_cpf_cnpj AS cpf_cnpj,
-               p.banco_destino AS banco, p.tipo_servico AS servico,
+               p.banco_destino AS banco, COALESCE(p.banco_municipio, '') AS banco_municipio, p.tipo_servico AS servico,
                p.item_financiado AS item, p.valor_proposto, p.valor_total_os,
                p.criado_por, p.criado_em
         FROM propostas p
         JOIN clientes c ON c.cpf_cnpj = p.cliente_cpf_cnpj
         WHERE (:busca = '' OR UPPER(c.nome) LIKE :termo OR p.cliente_cpf_cnpj LIKE :termo_num)
           AND (:banco = 'TODOS' OR p.banco_destino = :banco)
+          AND (:ver_todos = TRUE OR LOWER(p.criado_por) = :usuario_atual)
         ORDER BY p.id DESC
         LIMIT :lim
     """)
@@ -1362,6 +1719,8 @@ with aba5:
                 "termo": f"%{busca_hist.strip().upper()}%",
                 "termo_num": f"%{apenas_digitos(busca_hist) or busca_hist.strip()}%",
                 "banco": banco_hist,
+                "ver_todos": ver_todos,
+                "usuario_atual": usuario_atual,
                 "lim": int(limite_hist),
             },
         )
@@ -1375,7 +1734,7 @@ with aba5:
         df_exibir["criado_em"] = pd.to_datetime(df_exibir["criado_em"]).dt.strftime("%d/%m/%Y %H:%M")
 
         df_tabela = df_exibir[[
-            "id", "data_proposta", "cliente", "cpf_cnpj", "banco",
+            "id", "data_proposta", "cliente", "cpf_cnpj", "banco", "banco_municipio",
             "servico", "item", "valor_proposto_fmt", "valor_total_os_fmt",
             "criado_por", "criado_em",
         ]].fillna("").rename(columns={
@@ -1384,6 +1743,7 @@ with aba5:
             "cliente": "Produtor / Cliente",
             "cpf_cnpj": "CPF/CNPJ",
             "banco": "Banco",
+            "banco_municipio": "Município Banco",
             "servico": "Linha / Serviço",
             "item": "Item Financiado",
             "valor_proposto_fmt": "Valor Proposto",
@@ -1405,40 +1765,311 @@ with aba5:
             args=(op_props[prop_sel],),
         )
 
-        buf_xlsx = io.BytesIO()
-        with pd.ExcelWriter(buf_xlsx, engine="openpyxl") as writer:
-            df_tabela.to_excel(writer, index=False, sheet_name="Historico_Propostas")
-        c_exp.write("")
-        c_exp.write("")
-        c_exp.download_button(
-            "📥 Exportar Histórico em Excel (.xlsx)",
-            data=buf_xlsx.getvalue(),
-            file_name="historico_propostas_regularize.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+        if tem_permissao("exportar_excel"):
+            buf_xlsx = io.BytesIO()
+            with pd.ExcelWriter(buf_xlsx, engine="openpyxl") as writer:
+                df_tabela.to_excel(writer, index=False, sheet_name="Historico_Propostas")
+            c_exp.write("")
+            c_exp.write("")
+            c_exp.download_button(
+                "📥 Exportar Histórico em Excel (.xlsx)",
+                data=buf_xlsx.getvalue(),
+                file_name="historico_propostas_regularize.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        else:
+            c_exp.caption("🔒 Exportação em Excel restrita ao Admin/Supervisor.")
     else:
         st.info("Nenhuma proposta salva encontrada para os filtros informados.")
 
     st.divider()
     st.subheader("🏢 Cadastrar Nova Contabilidade")
-    with st.form("form_nova_contabilidade", clear_on_submit=True):
-        nc1, nc2 = st.columns(2)
-        novo_nome_cont = nc1.text_input("Nome do Escritório / Contador")
-        novo_cnpj_cont = nc2.text_input("CNPJ (opcional)")
-        if st.form_submit_button("➕ Salvar Contabilidade"):
-            if novo_nome_cont.strip():
-                with engine.begin() as conn:
-                    conn.execute(
-                        text("""
-                            INSERT INTO contabilidades (nome, cnpj)
-                            VALUES (:n, :c)
-                            ON CONFLICT (nome) DO UPDATE SET cnpj = EXCLUDED.cnpj
-                        """),
-                        {"n": novo_nome_cont.strip(), "c": fmt_doc(novo_cnpj_cont.strip())},
-                    )
-                carregar_listas_auxiliares.clear()
-                st.success(f"✅ Contabilidade '{novo_nome_cont.strip()}' cadastrada com sucesso!")
-                st.rerun()
+    if not tem_permissao("cadastrar_contabilidade"):
+        st.caption("🔒 Seu usuário não tem autorização para cadastrar novas contabilidades.")
+    else:
+        with st.form("form_nova_contabilidade", clear_on_submit=True):
+            nc1, nc2 = st.columns(2)
+            novo_nome_cont = nc1.text_input("Nome do Escritório / Contador")
+            novo_cnpj_cont = nc2.text_input("CNPJ (opcional)")
+            if st.form_submit_button("➕ Salvar Contabilidade"):
+                if novo_nome_cont.strip():
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text("""
+                                INSERT INTO contabilidades (nome, cnpj)
+                                VALUES (:n, :c)
+                                ON CONFLICT (nome) DO UPDATE SET cnpj = EXCLUDED.cnpj
+                            """),
+                            {"n": novo_nome_cont.strip(), "c": fmt_doc(novo_cnpj_cont.strip())},
+                        )
+                    carregar_listas_auxiliares.clear()
+                    st.success(f"✅ Contabilidade '{novo_nome_cont.strip()}' cadastrada com sucesso!")
+                    st.rerun()
+                else:
+                    st.warning("Informe o nome da contabilidade.")
+
+
+# ----------------------------------------------------------------------------
+# ABA 6: PAINEL DO ADMINISTRADOR (USUÁRIOS E TIPOS DE AUTORIZAÇÕES POR SENHA)
+# ----------------------------------------------------------------------------
+if aba6_admin is not None:
+    with aba6_admin:
+        st.subheader("🔐 Administração de Usuários e Autorizações")
+        st.info(
+            "🛡️ **Segurança reforçada:** Apenas o Administrador visualiza esta aba. "
+            "Para cadastrar novos usuários, alterar autorizações, redefinir senhas ou desativar acessos, "
+            "é obrigatório confirmar com a **Senha do Administrador**."
+        )
+
+        # Carregar todos os usuários cadastrados no banco
+        with engine.connect() as conn:
+            df_users = pd.read_sql(
+                text("""
+                    SELECT email, nome, perfil, ativo, permissoes, criado_por, criado_em, atualizado_em
+                    FROM usuarios_sistema
+                    ORDER BY ativo DESC, perfil, email
+                """),
+                conn,
+            )
+
+        st.markdown("#### 👥 Usuários Cadastrados e Suas Autorizações")
+        if not df_users.empty:
+            linhas_u = []
+            for _, ru in df_users.iterrows():
+                p_dict = ru["permissoes"] if isinstance(ru["permissoes"], dict) else {}
+                perms_ativas = [
+                    k.replace("_", " ").title()
+                    for k in PERMISSOES_DESCRICAO.keys()
+                    if (ru["perfil"] == "ADMIN" or p_dict.get(k, False))
+                ]
+                linhas_u.append({
+                    "E-mail": ru["email"],
+                    "Nome": ru["nome"] or "",
+                    "Perfil": ru["perfil"],
+                    "Status": "✅ Ativo" if ru["ativo"] else "⛔ Desativado",
+                    "Autorizações Liberadas": ", ".join(perms_ativas) if perms_ativas else "Nenhuma",
+                    "Criado por": ru["criado_por"] or "",
+                })
+            st.dataframe(pd.DataFrame(linhas_u), use_container_width=True, hide_index=True)
+        else:
+            st.info("Nenhum usuário cadastrado na tabela ainda.")
+
+        st.divider()
+        col_add_u, col_edit_u = st.columns(2)
+
+        # ====================================================================
+        # BLOCO A: ADICIONAR NOVO USUÁRIO (SOMENTE ADMIN COM SENHA)
+        # ====================================================================
+        with col_add_u:
+            st.markdown("### ➕ Adicionar Novo Usuário")
+            perfil_novo = st.selectbox(
+                "Perfil de Autorização do Novo Usuário",
+                options=list(PERFIS_AUTORIZACAO.keys()),
+                format_func=lambda k: f"{k} — {PERFIS_AUTORIZACAO[k]['rotulo']}",
+                index=list(PERFIS_AUTORIZACAO.keys()).index("ATENDENTE"),
+                key="adm_novo_perfil",
+            )
+            perms_modelo_novo = dict(PERFIS_AUTORIZACAO[perfil_novo]["permissoes"])
+
+            with st.form("form_adm_add_usuario", clear_on_submit=True):
+                novo_nome_u = st.text_input("Nome completo do usuário *")
+                novo_email_u = st.text_input("E-mail de acesso *").strip().lower()
+                nova_senha_u = st.text_input("Senha inicial do usuário *", type="password")
+                nova_senha_u2 = st.text_input("Confirmar senha inicial *", type="password")
+
+                st.markdown("**Autorizações que serão liberadas para este usuário:**")
+                perms_escolhidas_novo = {}
+                for chave_p, desc_p in PERMISSOES_DESCRICAO.items():
+                    val_def = bool(perms_modelo_novo.get(chave_p, False))
+                    if perfil_novo == "ADMIN":
+                        st.checkbox(desc_p, value=True, disabled=True, key=f"adm_new_p_{perfil_novo}_{chave_p}")
+                        perms_escolhidas_novo[chave_p] = True
+                    else:
+                        perms_escolhidas_novo[chave_p] = st.checkbox(
+                            desc_p,
+                            value=val_def,
+                            key=f"adm_new_p_{perfil_novo}_{chave_p}",
+                        )
+
+                st.divider()
+                senha_admin_add = st.text_input(
+                    "🔑 Senha do Administrador (obrigatória para liberar cadastro) *",
+                    type="password",
+                )
+                btn_criar_u = st.form_submit_button("✅ Criar Usuário e Liberar Autorizações", type="primary", use_container_width=True)
+
+                if btn_criar_u:
+                    if not validar_senha_admin(senha_admin_add):
+                        st.error("❌ Senha do Administrador incorreta! Operação bloqueada.")
+                    elif not novo_nome_u.strip() or not novo_email_u or "@" not in novo_email_u:
+                        st.error("❌ Informe um Nome e um E-mail válido.")
+                    elif len(nova_senha_u) < 4:
+                        st.error("❌ A senha inicial do usuário deve ter pelo menos 4 caracteres.")
+                    elif nova_senha_u != nova_senha_u2:
+                        st.error("❌ A confirmação da senha inicial não confere.")
+                    else:
+                        if perfil_novo == "ADMIN":
+                            perms_finais = {k: True for k in PERMISSOES_DESCRICAO}
+                        else:
+                            perms_finais = perms_escolhidas_novo
+                        with engine.begin() as conn:
+                            ja_existe = conn.execute(
+                                text("SELECT 1 FROM usuarios_sistema WHERE LOWER(email) = :e"),
+                                {"e": novo_email_u},
+                            ).first()
+                            if ja_existe:
+                                st.error(f"❌ Já existe um usuário cadastrado com o e-mail '{novo_email_u}'. Use o painel ao lado para editá-lo.")
+                            else:
+                                conn.execute(
+                                    text("""
+                                        INSERT INTO usuarios_sistema (
+                                            email, nome, senha_hash, perfil, ativo, permissoes, criado_por
+                                        ) VALUES (
+                                            :e, :n, :sh, :perf, TRUE, CAST(:perms AS jsonb), :cp
+                                        )
+                                    """),
+                                    {
+                                        "e": novo_email_u,
+                                        "n": novo_nome_u.strip(),
+                                        "sh": gerar_hash_senha(nova_senha_u),
+                                        "perf": perfil_novo,
+                                        "perms": json.dumps(perms_finais, ensure_ascii=False),
+                                        "cp": usuario_atual,
+                                    },
+                                )
+                                st.success(f"✅ Usuário '{novo_nome_u.strip()}' ({novo_email_u}) criado com sucesso!")
+                                st.rerun()
+
+        # ====================================================================
+        # BLOCO B: LIBERAR/EDITAR AUTORIZAÇÕES, SENHA OU STATUS DE USUÁRIO
+        # ====================================================================
+        with col_edit_u:
+            st.markdown("### 🛡️ Gerenciar Autorizações e Senha de Usuário")
+            if df_users.empty:
+                st.caption("Cadastre o primeiro usuário ao lado.")
             else:
-                st.warning("Informe o nome da contabilidade.")
+                lista_emails_u = df_users["email"].tolist()
+                email_sel = st.selectbox("Selecione o usuário para configurar:", lista_emails_u, key="adm_edit_sel")
+                u_edit = carregar_usuario_db(email_sel)
+
+                if u_edit:
+                    op_perfis = list(PERFIS_AUTORIZACAO.keys())
+                    idx_p_u = op_perfis.index(u_edit["perfil"]) if u_edit["perfil"] in op_perfis else op_perfis.index("PERSONALIZADO")
+                    perfil_edit = st.selectbox(
+                        "Alterar Perfil Base (atualiza as sugestões abaixo):",
+                        options=op_perfis,
+                        index=idx_p_u,
+                        format_func=lambda k: f"{k} — {PERFIS_AUTORIZACAO[k]['rotulo']}",
+                        key=f"adm_edit_perf_{email_sel}",
+                    )
+                    usar_modelo_perfil = perfil_edit != u_edit["perfil"]
+                    perms_base_edit = (
+                        dict(PERFIS_AUTORIZACAO[perfil_edit]["permissoes"])
+                        if usar_modelo_perfil
+                        else dict(u_edit["permissoes"])
+                    )
+
+                    with st.form(f"form_adm_edit_u_{email_sel}"):
+                        edit_nome = st.text_input("Nome do usuário", value=u_edit["nome"])
+                        edit_ativo = st.checkbox("Usuário ATIVO (desmarque para bloquear o login)", value=u_edit["ativo"])
+                        edit_nova_senha = st.text_input(
+                            "Redefinir senha deste usuário (deixe em branco para manter a senha atual)",
+                            type="password",
+                        )
+
+                        st.markdown("**Tipos de Autorizações Liberadas:**")
+                        perms_edit_marcadas = {}
+                        for chave_p, desc_p in PERMISSOES_DESCRICAO.items():
+                            val_atual = True if perfil_edit == "ADMIN" else bool(perms_base_edit.get(chave_p, False))
+                            if perfil_edit == "ADMIN":
+                                st.checkbox(desc_p, value=True, disabled=True, key=f"adm_ed_{email_sel}_{perfil_edit}_{chave_p}")
+                                perms_edit_marcadas[chave_p] = True
+                            else:
+                                perms_edit_marcadas[chave_p] = st.checkbox(
+                                    desc_p,
+                                    value=val_atual,
+                                    key=f"adm_ed_{email_sel}_{perfil_edit}_{chave_p}",
+                                )
+
+                        st.divider()
+                        senha_admin_edit = st.text_input(
+                            "🔑 Senha do Administrador (obrigatória para salvar autorizações) *",
+                            type="password",
+                        )
+                        btn_salvar_u = st.form_submit_button("💾 Salvar Alterações e Autorizações", type="primary", use_container_width=True)
+
+                        if btn_salvar_u:
+                            if not validar_senha_admin(senha_admin_edit):
+                                st.error("❌ Senha do Administrador incorreta! Nenhuma alteração foi salva.")
+                            elif email_sel == usuario_atual and (not edit_ativo or not perms_edit_marcadas.get("gerenciar_usuarios")):
+                                st.error("❌ Você não pode desativar ou remover o acesso de Administrador do seu próprio usuário logado.")
+                            elif edit_nova_senha and len(edit_nova_senha) < 4:
+                                st.error("❌ A nova senha deve ter pelo menos 4 caracteres.")
+                            else:
+                                # Se o Admin personalizou checkboxes fora do perfil padrão, marca como PERSONALIZADO (exceto ADMIN)
+                                perfil_gravar = perfil_edit
+                                if perfil_edit != "ADMIN" and perms_edit_marcadas != PERFIS_AUTORIZACAO[perfil_edit]["permissoes"]:
+                                    perfil_gravar = "PERSONALIZADO"
+
+                                with engine.begin() as conn:
+                                    if edit_nova_senha:
+                                        conn.execute(
+                                            text("""
+                                                UPDATE usuarios_sistema SET
+                                                    nome = :n,
+                                                    senha_hash = :sh,
+                                                    perfil = :perf,
+                                                    ativo = :at,
+                                                    permissoes = CAST(:perms AS jsonb),
+                                                    atualizado_em = NOW()
+                                                WHERE LOWER(email) = :e
+                                            """),
+                                            {
+                                                "n": edit_nome.strip(),
+                                                "sh": gerar_hash_senha(edit_nova_senha),
+                                                "perf": perfil_gravar,
+                                                "at": bool(edit_ativo),
+                                                "perms": json.dumps(perms_edit_marcadas, ensure_ascii=False),
+                                                "e": email_sel.lower(),
+                                            },
+                                        )
+                                    else:
+                                        conn.execute(
+                                            text("""
+                                                UPDATE usuarios_sistema SET
+                                                    nome = :n,
+                                                    perfil = :perf,
+                                                    ativo = :at,
+                                                    permissoes = CAST(:perms AS jsonb),
+                                                    atualizado_em = NOW()
+                                                WHERE LOWER(email) = :e
+                                            """),
+                                            {
+                                                "n": edit_nome.strip(),
+                                                "perf": perfil_gravar,
+                                                "at": bool(edit_ativo),
+                                                "perms": json.dumps(perms_edit_marcadas, ensure_ascii=False),
+                                                "e": email_sel.lower(),
+                                            },
+                                        )
+                                st.success(f"✅ Autorizações de '{email_sel}' atualizadas com sucesso!")
+                                st.rerun()
+
+                    # Opção de excluir usuário (com proteção contra excluir o próprio admin)
+                    if email_sel != usuario_atual:
+                        with st.expander(f"🗑️ Excluir permanentemente o usuário {email_sel}"):
+                            with st.form(f"form_del_u_{email_sel}", clear_on_submit=True):
+                                st.warning("Atenção: o histórico de propostas criadas por este usuário será mantido, mas o login dele será removido.")
+                                senha_admin_del = st.text_input("🔑 Senha do Administrador para confirmar exclusão *", type="password")
+                                if st.form_submit_button("🗑️ Confirmar Exclusão do Usuário"):
+                                    if validar_senha_admin(senha_admin_del):
+                                        with engine.begin() as conn:
+                                            conn.execute(
+                                                text("DELETE FROM usuarios_sistema WHERE LOWER(email) = :e"),
+                                                {"e": email_sel.lower()},
+                                            )
+                                        st.success(f"Usuário '{email_sel}' excluído.")
+                                        st.rerun()
+                                    else:
+                                        st.error("❌ Senha do Administrador incorreta.")
