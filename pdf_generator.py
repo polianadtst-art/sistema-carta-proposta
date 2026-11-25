@@ -58,35 +58,91 @@ ALTURA_UTIL = A4[1] - (2 * MARGEM_V)    # ~27,10 cm
 # ============================================================================
 # FUNÇÕES DE FORMATAÇÃO PT-BR (CAMPO VAZIO = 100% EM BRANCO, SEM ZEROS/TRAÇOS)
 # ============================================================================
+def parse_moeda_br(valor):
+    """
+    Converte qualquer entrada monetária brasileira ou numérica em float (ou None se vazio/zero).
+    Exemplos aceitos: '10.000,00', '10000', '10.000', '10000,5', 'R$ 2.500,75', 10000.0.
+    Retorna None para vazio, None ou 0 (nunca gera 0,00 indesejado).
+    """
+    if valor is None:
+        return None
+    if isinstance(valor, (int, float)):
+        v = float(valor)
+        return round(v, 2) if abs(v) >= 0.005 else None
+
+    s = str(valor).strip()
+    if not s:
+        return None
+    # Remove 'R$', espaços e caracteres não numéricos (mantendo dígitos, ponto, vírgula e sinal)
+    s = s.replace("R$", "").replace("r$", "").strip()
+    s = "".join(ch for ch in s if ch.isdigit() or ch in ".,-")
+    if not s or s in ("-", ".", ",", "-.", "-,"):
+        return None
+
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            # Padrão brasileiro: 10.000,50
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            # Padrão americano: 10,000.50
+            s = s.replace(",", "")
+    elif "," in s:
+        # Apenas vírgula: 10000,50 ou 2,45
+        if s.count(",") == 1:
+            s = s.replace(",", ".")
+        else:
+            partes = s.split(",")
+            if len(partes[-1]) in (1, 2):
+                s = "".join(partes[:-1]) + "." + partes[-1]
+            else:
+                s = "".join(partes)
+    elif "." in s:
+        # Apenas ponto: diferencia milhar brasileiro (10.000) de decimal (10000.50)
+        if s.count(".") > 1:
+            partes = s.split(".")
+            if len(partes[-1]) in (1, 2):
+                s = "".join(partes[:-1]) + "." + partes[-1]
+            else:
+                s = "".join(partes)
+        else:
+            antes, depois = s.split(".", 1)
+            if len(depois) == 3 and depois.isdigit():
+                # Ex.: "10.000" -> 10000 (milhar brasileiro)
+                s = antes + depois
+
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    return round(v, 2) if abs(v) >= 0.005 else None
+
+
+def fmt_input_moeda_br(valor):
+    """Formata valor monetário no padrão brasileiro para campos de tela: ex. '10.000,00'. Vazio/zero -> ''."""
+    v = parse_moeda_br(valor)
+    if v is None:
+        return ""
+    sinal = "-" if v < 0 else ""
+    texto = f"{abs(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{sinal}{texto}"
+
+
 def fmt_moeda(valor, vazio_se_zero=True):
     """
-    Formata 500000 como 'R$ 500.000,00'.
+    Formata 10000 como 'R$ 10.000,00'.
     Se o valor for vazio, None ou 0 (com vazio_se_zero=True), retorna '' (em branco).
     """
-    if valor is None or str(valor).strip() == "":
+    v = parse_moeda_br(valor)
+    if v is None:
         return "" if vazio_se_zero else "R$ 0,00"
-    try:
-        v = float(valor)
-    except (TypeError, ValueError):
-        return ""
-    if vazio_se_zero and abs(v) < 0.005:
-        return ""
     sinal = "-" if v < 0 else ""
     texto = f"{abs(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     return f"{sinal}R$ {texto}"
 
 
 def fmt_valor_sem_rs(valor):
-    """Formata 1200 como '1.200,00' (sem 'R$'). Se vazio ou zero, retorna ''."""
-    if valor is None or str(valor).strip() == "":
-        return ""
-    try:
-        v = float(valor)
-    except (TypeError, ValueError):
-        return ""
-    if abs(v) < 0.005:
-        return ""
-    return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    """Formata 10000 como '10.000,00' (sem 'R$'). Se vazio ou zero, retorna ''."""
+    return fmt_input_moeda_br(valor)
 
 
 def fmt_pct_br(valor_pct):
@@ -683,9 +739,9 @@ def doc_producao(d, est):
                 Paragraph(f"<b>Prod. 2024:</b> {safe(p.get('prod_2024'))}", est["compacto"]),
             ],
             [
-                Paragraph(f"<b>Venda 2026:</b> {fmt_moeda(p.get('venda_2026'), vazio_se_zero=False)}", est["compacto"]),
-                Paragraph(f"<b>Venda 2025:</b> {fmt_moeda(p.get('venda_2025'), vazio_se_zero=False)}", est["compacto"]),
-                Paragraph(f"<b>Venda 2024:</b> {fmt_moeda(p.get('venda_2024'), vazio_se_zero=False)}", est["compacto"]),
+                Paragraph(f"<b>Venda 2026:</b> {fmt_moeda(p.get('venda_2026'))}", est["compacto"]),
+                Paragraph(f"<b>Venda 2025:</b> {fmt_moeda(p.get('venda_2025'))}", est["compacto"]),
+                Paragraph(f"<b>Venda 2024:</b> {fmt_moeda(p.get('venda_2024'))}", est["compacto"]),
                 Paragraph(f"<b>Variedades:</b> {safe(p.get('variedades'))}", est["compacto"]),
             ],
         ], colWidths=[4.55 * cm, 4.55 * cm, 4.55 * cm, 4.55 * cm])
@@ -707,22 +763,20 @@ def doc_producao(d, est):
 
     sem = prod.get("semoventes") or {}
     re1_desc = safe(prod.get("renda_extra_1_desc"))
-    re1_val_num = float(prod.get("renda_extra_1_val") or 0.0)
-    re1_val = fmt_moeda(re1_val_num, vazio_se_zero=False)
-    re1_txt = f"{re1_desc} ({re1_val})" if re1_desc else re1_val
+    re1_val_num = parse_moeda_br(prod.get("renda_extra_1_val")) or 0.0
+    re1_val = fmt_moeda(re1_val_num)
+    re1_txt = f"{re1_desc} ({re1_val})" if (re1_desc and re1_val) else (re1_desc or re1_val)
 
     re2_desc = safe(prod.get("renda_extra_2_desc"))
-    re2_val_num = float(prod.get("renda_extra_2_val") or 0.0)
-    re2_val = fmt_moeda(re2_val_num, vazio_se_zero=False)
-    re2_txt = f"{re2_desc} ({re2_val})" if re2_desc else re2_val
+    re2_val_num = parse_moeda_br(prod.get("renda_extra_2_val")) or 0.0
+    re2_val = fmt_moeda(re2_val_num)
+    re2_txt = f"{re2_desc} ({re2_val})" if (re2_desc and re2_val) else (re2_desc or re2_val)
 
-    # Recalcula a Renda Bruta Anual somando todas as vendas 2026 + rendas extras (sempre exibe R$ 0,00 ou soma)
-    soma_vendas_2026 = sum(float(px.get("venda_2026") or 0.0) for px in props)
+    # Soma Vendas 2026 + Rendas Extras; se nada foi preenchido, fica 100% em branco (sem R$ 0,00!)
+    soma_vendas_2026 = sum((parse_moeda_br(px.get("venda_2026")) or 0.0) for px in props)
     renda_bruta_calc = round(soma_vendas_2026 + re1_val_num + re2_val_num, 2)
-    if d.get("renda_bruta_anual") is not None and float(d.get("renda_bruta_anual") or 0.0) > 0:
-        renda_bruta_exib = float(d.get("renda_bruta_anual"))
-    else:
-        renda_bruta_exib = renda_bruta_calc
+    rb_param = parse_moeda_br(d.get("renda_bruta_anual"))
+    renda_bruta_exib = rb_param if rb_param else (renda_bruta_calc if renda_bruta_calc > 0 else None)
 
     g_sem = [
         faixa_secao("SEMOVENTES, RENDA EXTRA E BENS", est),
@@ -730,7 +784,7 @@ def doc_producao(d, est):
             [
                 Paragraph(f"<b>Vacas de Leite:</b> {fmt_num(sem.get('vacas_leite'))}", est["normal"]),
                 Paragraph(f"<b>Litros por Dia:</b> {fmt_num(sem.get('litros_dia'))}", est["normal"]),
-                Paragraph(f"<b>Preço por Litro:</b> {fmt_moeda(sem.get('preco_litro'), vazio_se_zero=False)}", est["normal"]),
+                Paragraph(f"<b>Preço por Litro:</b> {fmt_moeda(sem.get('preco_litro'))}", est["normal"]),
             ],
             [
                 Paragraph(f"<b>Boi de Corte:</b> {fmt_num(sem.get('boi_corte'))}", est["normal"]),
@@ -740,7 +794,7 @@ def doc_producao(d, est):
             [
                 Paragraph(f"<b>Renda Extra 1:</b> {re1_txt}", est["normal"]),
                 Paragraph(f"<b>Renda Extra 2:</b> {re2_txt}", est["normal"]),
-                Paragraph(f"<b>RENDA BRUTA ANUAL: {fmt_moeda(renda_bruta_exib, vazio_se_zero=False)}</b>", est["normal_bold"]),
+                Paragraph(f"<b>RENDA BRUTA ANUAL: {fmt_moeda(renda_bruta_exib)}</b>", est["normal_bold"]),
             ],
         ], [6.1 * cm, 6.0 * cm, 6.1 * cm], est, pad_v=3.2),
         tabela_pb([
@@ -825,15 +879,16 @@ def doc_ordem_servico(d, est):
     ]
 
     # Cálculos financeiros da Ordem de Serviço
-    val_prop = float(d.get("valor_proposto") or 0)
+    val_prop = parse_moeda_br(d.get("valor_proposto")) or 0.0
     tem_valor = val_prop > 0
-    val_cheio = float(d.get("valor_cheio_os") or round(val_prop * TAXA_HONORARIO_CHEIA, 2)) if tem_valor else 0.0
+    val_cheio = (parse_moeda_br(d.get("valor_cheio_os")) or round(val_prop * TAXA_HONORARIO_CHEIA, 2)) if tem_valor else 0.0
     pct_final = float(d.get("percentual_honorario") if d.get("percentual_honorario") is not None else TAXA_HONORARIO_CHEIA)
     pct_desc_faixa = max(0.0, round(TAXA_HONORARIO_CHEIA - pct_final, 6))
-    desc_faixa = float(d.get("desconto_faixa") if d.get("desconto_faixa") is not None else round(val_prop * pct_desc_faixa, 2)) if tem_valor else 0.0
-    desc_extra = float(d.get("desconto_extra") or 0.0)
+    desc_faixa = (parse_moeda_br(d.get("desconto_faixa")) if d.get("desconto_faixa") is not None else round(val_prop * pct_desc_faixa, 2)) if tem_valor else 0.0
+    desc_faixa = desc_faixa or 0.0
+    desc_extra = parse_moeda_br(d.get("desconto_extra")) or 0.0
     desc_total = round(desc_faixa + desc_extra, 2)
-    acresc = float(d.get("acrescimos") or 0.0)
+    acresc = parse_moeda_br(d.get("acrescimos")) or 0.0
     total_os = max(0.0, round(val_cheio - desc_total + acresc, 2)) if (tem_valor or acresc > 0) else 0.0
 
     # Porcentagem de desconto concedida (exibe APENAS a porcentagem no campo Desconto!)
@@ -955,20 +1010,33 @@ def doc_protecao_dados(d, est):
     )
     g_p1 = [Paragraph(safe(p1), est["justificado_grande"])]
 
-    banco_sel = safe(d.get("banco_destino"))
-    banco_mun = safe(d.get("banco_municipio"))
-    banco_full = f"{banco_sel} — {banco_mun}" if (banco_sel and banco_mun) else (banco_sel or banco_mun)
-    inst_txt = f"{banco_full} (Instituições financeiras e cooperativas de crédito)" if banco_full else "Instituições financeiras e cooperativas de crédito"
-    g_tab = [tabela_pb([
+    t_lgpd = Table(
         [
-            Paragraph(f"<b>Contabilidade Indicada:</b> {safe(d.get('contabilidade_nome'))}", est["normal"]),
-            Paragraph(f"<b>CNPJ Contabilidade:</b> {fmt_doc(d.get('contabilidade_cnpj'))}", est["normal"]),
+            [
+                Paragraph(f"<b>Contabilidade Indicada:</b> {safe(d.get('contabilidade_nome'))}", est["normal"]),
+                Paragraph(f"<b>CNPJ Contabilidade:</b> {fmt_doc(d.get('contabilidade_cnpj'))}", est["normal"]),
+            ],
+            [
+                Paragraph(
+                    "<b>Este documento é válido para todas as instituições financeiras e cooperativas de crédito.</b>",
+                    est["centro"],
+                ),
+                "",
+            ],
         ],
-        [
-            Paragraph(f"<b>Instituição Financeira:</b> {inst_txt}", est["normal"]),
-            Paragraph("<b>Abrangência:</b> Instituições financeiras e cooperativas de crédito", est["normal"]),
-        ],
-    ], [9.1 * cm, 9.1 * cm], est, pad_v=5.5)]
+        colWidths=[9.1 * cm, 9.1 * cm],
+    )
+    t_lgpd.setStyle(TableStyle([
+        ("SPAN", (0, 1), (1, 1)),
+        ("GRID", (0, 0), (-1, -1), 0.55, est["cor_borda"]),
+        ("BACKGROUND", (0, 1), (1, 1), est["cor_faixa"]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 5.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5.5),
+    ]))
+    g_tab = [t_lgpd]
 
     p2 = (
         "O tratamento pode incluir coleta, consulta, conferência, organização, armazenamento e compartilhamento "

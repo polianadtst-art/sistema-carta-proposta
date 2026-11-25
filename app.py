@@ -1,5 +1,5 @@
 # ============================================================================
-# ARQUIVO: app.py (Versão 9.0 — Regularize Assessoria Rural)
+# ARQUIVO: app.py (Versão 10.0 — Regularize Assessoria Rural)
 # O QUE ESTE ARQUIVO FAZ:
 #   Sistema web multiusuário em Português do Brasil (PT-BR) conectado ao
 #   PostgreSQL (Supabase), com:
@@ -57,7 +57,7 @@ from config import (
     TIPOS_ENVIO_PADRAO,
     TODOS_OS_DOCUMENTOS,
 )
-from pdf_generator import fmt_cep, fmt_doc, fmt_moeda, fmt_pct_br, gerar_pdf_bytes
+from pdf_generator import fmt_cep, fmt_doc, fmt_input_moeda_br, fmt_moeda, fmt_pct_br, gerar_pdf_bytes, parse_moeda_br
 
 # Fuso horário de Brasília (UTC-3) para exibir horário real do salvamento automático
 FUSO_BRASILIA = timezone(timedelta(hours=-3))
@@ -570,12 +570,12 @@ def carregar_listas_auxiliares():
 
 
 def _propriedade_vazia():
-    """Na Análise Produtiva, valores de venda iniciam em 0.0 (R$ 0,00) para somar ao final."""
+    """Na Análise Produtiva, todos os campos monetários iniciam vazios (None) — sem 0,00."""
     return {
         "nome": "", "matricula": "", "num_pes": None, "espacamento": "",
         "variedades": "", "idade": "", "prev_2027": "",
         "prod_2026": "", "prod_2025": "", "prod_2024": "",
-        "venda_2026": 0.0, "venda_2025": 0.0, "venda_2024": 0.0,
+        "venda_2026": None, "venda_2025": None, "venda_2024": None,
     }
 
 
@@ -597,6 +597,17 @@ CAMPOS_ESCALARES = [
     "renda_extra_1_desc", "renda_extra_1_val",
     "renda_extra_2_desc", "renda_extra_2_val", "bens",
 ]
+
+# Campos monetários no padrão brasileiro (ex.: 10.000,00; quando vazio fica em branco)
+CAMPOS_MONETARIOS_ESCALARES = {
+    "valor_proposto",
+    "credito_valor",
+    "parcela_consorcio",
+    "renda_extra_1_val",
+    "renda_extra_2_val",
+    "desconto_extra",
+    "acrescimos",
+}
 
 
 def inicializar_estado_proposta():
@@ -658,13 +669,13 @@ def inicializar_estado_proposta():
         "checklist_docs": {},
         "propriedades_lista": [_propriedade_vazia()],
         "semoventes": {
-            "vacas_leite": None, "litros_dia": None, "preco_litro": 0.0,
+            "vacas_leite": None, "litros_dia": None, "preco_litro": None,
             "boi_corte": None, "novilhas": None, "bezerros": None,
         },
         "renda_extra_1_desc": "",
-        "renda_extra_1_val": 0.0,
+        "renda_extra_1_val": None,
         "renda_extra_2_desc": "",
-        "renda_extra_2_val": 0.0,
+        "renda_extra_2_val": None,
         "bens": "",
     }
     for k, v in padrao.items():
@@ -684,10 +695,17 @@ def limpar_chaves_widgets():
 
 def definir_campo(chave, valor):
     """Atualiza tanto o dado principal quanto o widget correspondente (se visível)."""
-    st.session_state[chave] = valor
-    wk = f"_w_{chave}"
-    if wk in st.session_state:
-        st.session_state[wk] = valor
+    if chave in CAMPOS_MONETARIOS_ESCALARES:
+        num = parse_moeda_br(valor)
+        st.session_state[chave] = num
+        wk = f"_w_{chave}"
+        if wk in st.session_state:
+            st.session_state[wk] = fmt_input_moeda_br(num)
+    else:
+        st.session_state[chave] = valor
+        wk = f"_w_{chave}"
+        if wk in st.session_state:
+            st.session_state[wk] = valor
 
 
 def preparar_widget(chave):
@@ -695,6 +713,14 @@ def preparar_widget(chave):
     wk = f"_w_{chave}"
     if wk not in st.session_state:
         st.session_state[wk] = st.session_state.get(chave)
+    return wk
+
+
+def preparar_widget_moeda(chave):
+    """Garante que um campo monetário comece formatado como '10.000,00' ou '' (nunca '0,00')."""
+    wk = f"_w_{chave}"
+    if wk not in st.session_state:
+        st.session_state[wk] = fmt_input_moeda_br(st.session_state.get(chave))
     return wk
 
 
@@ -710,15 +736,41 @@ def preparar_widget_lista(chave, opcoes):
     return wk
 
 
-def cb_sync_campo(chave, formatar_doc=False):
-    """Copia o valor digitado no widget _w_<chave> para o estado principal."""
+def cb_sync_campo(chave, formatar_doc=False, formatar_moeda=False):
+    """Copia e formata o valor digitado no widget _w_<chave> para o estado principal."""
     wk = f"_w_{chave}"
     if wk in st.session_state:
         val = st.session_state[wk]
         if formatar_doc:
             val = fmt_doc(val)
             st.session_state[wk] = val
-        st.session_state[chave] = val
+            st.session_state[chave] = val
+        elif formatar_moeda or chave in CAMPOS_MONETARIOS_ESCALARES:
+            num = parse_moeda_br(val)
+            st.session_state[chave] = num
+            st.session_state[wk] = fmt_input_moeda_br(num)
+        else:
+            st.session_state[chave] = val
+
+
+def cb_sync_prop_moeda(idx, pref, campo_p):
+    """Formata valores monetários de venda nas propriedades (ex.: 10.000,00; vazio -> '')."""
+    wk = f"_w_p_{pref}_{idx}"
+    if wk in st.session_state:
+        num = parse_moeda_br(st.session_state[wk])
+        st.session_state[wk] = fmt_input_moeda_br(num)
+        props = st.session_state.get("propriedades_lista", [])
+        if 0 <= idx < len(props):
+            props[idx][campo_p] = num
+
+
+def cb_sync_sem_moeda(campo_s):
+    """Formata valores monetários de semoventes (ex.: 2,45 ou 10.000,00; vazio -> '')."""
+    wk = f"_w_sem_{campo_s}"
+    if wk in st.session_state:
+        num = parse_moeda_br(st.session_state[wk])
+        st.session_state[wk] = fmt_input_moeda_br(num)
+        st.session_state.setdefault("semoventes", {})[campo_s] = num
 
 
 def sincronizar_widgets_para_estado():
@@ -733,7 +785,13 @@ def sincronizar_widgets_para_estado():
             val = st.session_state[wk]
             if campo in ("cliente_cpf", "avalista_cpf", "conjuge_avalista_cpf"):
                 val = fmt_doc(val)
-            st.session_state[campo] = val
+                st.session_state[campo] = val
+            elif campo in CAMPOS_MONETARIOS_ESCALARES:
+                num = parse_moeda_br(val)
+                st.session_state[campo] = num
+                st.session_state[wk] = fmt_input_moeda_br(num)
+            else:
+                st.session_state[campo] = val
 
     # 2. Checklist de Documentos
     chk = st.session_state.get("checklist_docs", {})
@@ -755,14 +813,24 @@ def sincronizar_widgets_para_estado():
         for pref, campo_p in mapa_prop_campos.items():
             wk = f"_w_p_{pref}_{idx}"
             if wk in st.session_state:
-                p[campo_p] = st.session_state[wk]
+                if pref in ("v26", "v25", "v24"):
+                    num = parse_moeda_br(st.session_state[wk])
+                    p[campo_p] = num
+                    st.session_state[wk] = fmt_input_moeda_br(num)
+                else:
+                    p[campo_p] = st.session_state[wk]
 
     # 4. Semoventes da Análise Produtiva
     sem = st.session_state.get("semoventes", {})
     for campo_s in ("vacas_leite", "litros_dia", "preco_litro", "boi_corte", "novilhas", "bezerros"):
         wk = f"_w_sem_{campo_s}"
         if wk in st.session_state:
-            sem[campo_s] = st.session_state[wk]
+            if campo_s == "preco_litro":
+                num = parse_moeda_br(st.session_state[wk])
+                sem[campo_s] = num
+                st.session_state[wk] = fmt_input_moeda_br(num)
+            else:
+                sem[campo_s] = st.session_state[wk]
     st.session_state["semoventes"] = sem
 
 
@@ -959,9 +1027,9 @@ def cb_carregar_proposta(proposta_id):
             pc = _propriedade_vazia()
             pc.update(p)
             pc["num_pes"] = num_int_ou_none(pc.get("num_pes"))
-            pc["venda_2026"] = float(pc.get("venda_2026") or 0.0)
-            pc["venda_2025"] = float(pc.get("venda_2025") or 0.0)
-            pc["venda_2024"] = float(pc.get("venda_2024") or 0.0)
+            pc["venda_2026"] = parse_moeda_br(pc.get("venda_2026"))
+            pc["venda_2025"] = parse_moeda_br(pc.get("venda_2025"))
+            pc["venda_2024"] = parse_moeda_br(pc.get("venda_2024"))
             props_limpas.append(pc)
         st.session_state["propriedades_lista"] = props_limpas
     if prod.get("semoventes"):
@@ -969,15 +1037,15 @@ def cb_carregar_proposta(proposta_id):
         st.session_state["semoventes"] = {
             "vacas_leite": num_int_ou_none(s_raw.get("vacas_leite")),
             "litros_dia": num_float_ou_none(s_raw.get("litros_dia")),
-            "preco_litro": float(s_raw.get("preco_litro") or 0.0),
+            "preco_litro": parse_moeda_br(s_raw.get("preco_litro")),
             "boi_corte": num_int_ou_none(s_raw.get("boi_corte")),
             "novilhas": num_int_ou_none(s_raw.get("novilhas")),
             "bezerros": num_int_ou_none(s_raw.get("bezerros")),
         }
     st.session_state["renda_extra_1_desc"] = prod.get("renda_extra_1_desc", "")
-    st.session_state["renda_extra_1_val"] = float(prod.get("renda_extra_1_val") or 0.0)
+    st.session_state["renda_extra_1_val"] = parse_moeda_br(prod.get("renda_extra_1_val"))
     st.session_state["renda_extra_2_desc"] = prod.get("renda_extra_2_desc", "")
-    st.session_state["renda_extra_2_val"] = float(prod.get("renda_extra_2_val") or 0.0)
+    st.session_state["renda_extra_2_val"] = parse_moeda_br(prod.get("renda_extra_2_val"))
     st.session_state["bens"] = prod.get("bens", "")
 
     # Marca o estado carregado como já salvo (evita gravação desnecessária antes de editar)
@@ -995,26 +1063,24 @@ def montar_dicionario_proposta():
     pct_final = float(info_faixa["percentual"])
     pct_desc_faixa = max(0.0, round(TAXA_HONORARIO_CHEIA - pct_final, 6))
 
-    val_prop = float(st.session_state.get("valor_proposto") or 0.0)
+    val_prop = parse_moeda_br(st.session_state.get("valor_proposto")) or 0.0
     tem_valor = val_prop > 0
     valor_cheio_os = round(val_prop * TAXA_HONORARIO_CHEIA, 2) if tem_valor else 0.0
     desconto_faixa = round(val_prop * pct_desc_faixa, 2) if tem_valor else 0.0
-    desconto_extra = float(st.session_state.get("desconto_extra") or 0.0)
+    desconto_extra = parse_moeda_br(st.session_state.get("desconto_extra")) or 0.0
     desconto_total = round(desconto_faixa + desconto_extra, 2)
-    acresc = float(st.session_state.get("acrescimos") or 0.0)
+    acresc = parse_moeda_br(st.session_state.get("acrescimos")) or 0.0
 
     total_os = max(0.0, round(valor_cheio_os - desconto_total + acresc, 2)) if (tem_valor or acresc > 0) else 0.0
     n_parc = num_int_ou_none(st.session_state.get("num_parcelas"))
     val_parc = round(total_os / n_parc, 2) if (n_parc and total_os > 0) else 0.0
 
     props = st.session_state.get("propriedades_lista") or []
-    soma_vendas = sum(float(p.get("venda_2026") or 0) for p in props)
-    renda_bruta = round(
-        soma_vendas
-        + float(st.session_state.get("renda_extra_1_val") or 0)
-        + float(st.session_state.get("renda_extra_2_val") or 0),
-        2,
-    )
+    soma_vendas = round(sum((parse_moeda_br(p.get("venda_2026")) or 0.0) for p in props), 2)
+    re1_v = parse_moeda_br(st.session_state.get("renda_extra_1_val")) or 0.0
+    re2_v = parse_moeda_br(st.session_state.get("renda_extra_2_val")) or 0.0
+    soma_rendas_extras = round(re1_v + re2_v, 2)
+    renda_bruta = round(soma_vendas + soma_rendas_extras, 2)
 
     item_sel = st.session_state.get("item_financiado", "")
     if item_sel == "OUTRO ITEM (DIGITAR MANUALMENTE)":
@@ -1076,9 +1142,9 @@ def montar_dicionario_proposta():
         "conjuge_avalista_nome": st.session_state["conjuge_avalista_nome"].strip().upper(),
         "conjuge_avalista_cpf": apenas_digitos(st.session_state["conjuge_avalista_cpf"]),
         "credito_tipo": credito_tipo_final,
-        "credito_valor": num_float_ou_none(st.session_state.get("credito_valor")),
-        "beneficio_valor": num_float_ou_none(st.session_state.get("beneficio_valor")),
-        "parcela_consorcio": num_float_ou_none(st.session_state.get("parcela_consorcio")),
+        "credito_valor": parse_moeda_br(st.session_state.get("credito_valor")),
+        "beneficio_valor": parse_moeda_br(st.session_state.get("beneficio_valor")),
+        "parcela_consorcio": parse_moeda_br(st.session_state.get("parcela_consorcio")),
         "num_parcelas_consorcio": num_int_ou_none(st.session_state.get("num_parcelas_consorcio")),
         "parecer_agencia": st.session_state.get("parecer_agencia", "").strip(),
         "checklist_docs": st.session_state.get("checklist_docs", {}),
@@ -1086,18 +1152,14 @@ def montar_dicionario_proposta():
             "propriedades": props,
             "semoventes": st.session_state.get("semoventes", {}),
             "renda_extra_1_desc": st.session_state.get("renda_extra_1_desc", ""),
-            "renda_extra_1_val": float(st.session_state.get("renda_extra_1_val") or 0.0),
+            "renda_extra_1_val": parse_moeda_br(st.session_state.get("renda_extra_1_val")),
             "renda_extra_2_desc": st.session_state.get("renda_extra_2_desc", ""),
-            "renda_extra_2_val": float(st.session_state.get("renda_extra_2_val") or 0.0),
+            "renda_extra_2_val": parse_moeda_br(st.session_state.get("renda_extra_2_val")),
             "bens": st.session_state.get("bens", ""),
         },
-        "soma_vendas_2026": round(soma_vendas, 2),
-        "soma_rendas_extras": round(
-            float(st.session_state.get("renda_extra_1_val") or 0.0)
-            + float(st.session_state.get("renda_extra_2_val") or 0.0),
-            2,
-        ),
-        "renda_bruta_anual": round(renda_bruta, 2),
+        "soma_vendas_2026": soma_vendas if soma_vendas > 0 else None,
+        "soma_rendas_extras": soma_rendas_extras if soma_rendas_extras > 0 else None,
+        "renda_bruta_anual": renda_bruta if renda_bruta > 0 else None,
     }
 
 
@@ -1674,15 +1736,13 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
     )
 
     op4, op5 = st.columns(2)
-    op4.number_input(
+    op4.text_input(
         "Valor Proposto (R$)",
-        min_value=0.0,
-        step=1000.0,
-        format="%.2f",
-        key=preparar_widget("valor_proposto"),
+        key=preparar_widget_moeda("valor_proposto"),
         on_change=cb_sync_campo,
-        args=("valor_proposto",),
-        placeholder="",
+        args=("valor_proposto", False, True),
+        placeholder="Ex.: 10.000,00",
+        help="Digite o valor e aperte Enter ou Tab para formatar automaticamente no padrão 10.000,00.",
     )
 
     cont_raw = df_contabilidades["nome"].tolist()
@@ -1767,27 +1827,21 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
             args=("credito_modalidades",),
             placeholder="Selecione se desejar marcar automaticamente no PDF",
         )
-        st.number_input(
+        st.text_input(
             "Valor (R$)",
-            min_value=0.0,
-            step=100.0,
-            format="%.2f",
-            key=preparar_widget("credito_valor"),
+            key=preparar_widget_moeda("credito_valor"),
             on_change=cb_sync_campo,
-            args=("credito_valor",),
-            placeholder="",
+            args=("credito_valor", False, True),
+            placeholder="Ex.: 1.200,00",
         )
         st.caption("**Consórcio:**")
         m3, m4 = st.columns(2)
-        m3.number_input(
+        m3.text_input(
             "Valor da Parcela do Consórcio (R$)",
-            min_value=0.0,
-            step=50.0,
-            format="%.2f",
-            key=preparar_widget("parcela_consorcio"),
+            key=preparar_widget_moeda("parcela_consorcio"),
             on_change=cb_sync_campo,
-            args=("parcela_consorcio",),
-            placeholder="",
+            args=("parcela_consorcio", False, True),
+            placeholder="Ex.: 850,00",
         )
         m4.number_input(
             "Quantidade de Parcelas do Consórcio",
@@ -1880,10 +1934,31 @@ elif aba_ativa == "🌱 2. Análise Produtiva":
             for pref_v, campo_v in [("v26", "venda_2026"), ("v25", "venda_2025"), ("v24", "venda_2024")]:
                 wk_v = f"_w_p_{pref_v}_{idx}"
                 if wk_v not in st.session_state:
-                    st.session_state[wk_v] = float(p.get(campo_v) or 0.0)
-            p["venda_2026"] = r4c1.number_input("Valor de Venda 2026 (R$)", min_value=0.0, step=500.0, key=f"_w_p_v26_{idx}", format="%.2f")
-            p["venda_2025"] = r4c2.number_input("Valor de Venda 2025 (R$)", min_value=0.0, step=500.0, key=f"_w_p_v25_{idx}", format="%.2f")
-            p["venda_2024"] = r4c3.number_input("Valor de Venda 2024 (R$)", min_value=0.0, step=500.0, key=f"_w_p_v24_{idx}", format="%.2f")
+                    st.session_state[wk_v] = fmt_input_moeda_br(p.get(campo_v))
+            r4c1.text_input(
+                "Valor de Venda 2026 (R$)",
+                key=f"_w_p_v26_{idx}",
+                on_change=cb_sync_prop_moeda,
+                args=(idx, "v26", "venda_2026"),
+                placeholder="Ex.: 10.000,00",
+            )
+            r4c2.text_input(
+                "Valor de Venda 2025 (R$)",
+                key=f"_w_p_v25_{idx}",
+                on_change=cb_sync_prop_moeda,
+                args=(idx, "v25", "venda_2025"),
+                placeholder="Ex.: 10.000,00",
+            )
+            r4c3.text_input(
+                "Valor de Venda 2024 (R$)",
+                key=f"_w_p_v24_{idx}",
+                on_change=cb_sync_prop_moeda,
+                args=(idx, "v24", "venda_2024"),
+                placeholder="Ex.: 10.000,00",
+            )
+            p["venda_2026"] = parse_moeda_br(st.session_state.get(f"_w_p_v26_{idx}"))
+            p["venda_2025"] = parse_moeda_br(st.session_state.get(f"_w_p_v25_{idx}"))
+            p["venda_2024"] = parse_moeda_br(st.session_state.get(f"_w_p_v24_{idx}"))
 
     st.divider()
     st.markdown("#### 🐄 Semoventes, Renda Extra e Bens")
@@ -1894,12 +1969,19 @@ elif aba_ativa == "🌱 2. Análise Produtiva":
     if "_w_sem_litros_dia" not in st.session_state:
         st.session_state["_w_sem_litros_dia"] = num_float_ou_none(sem.get("litros_dia"))
     if "_w_sem_preco_litro" not in st.session_state:
-        st.session_state["_w_sem_preco_litro"] = float(sem.get("preco_litro") or 0.0)
+        st.session_state["_w_sem_preco_litro"] = fmt_input_moeda_br(sem.get("preco_litro"))
 
     s1, s2, s3 = st.columns(3)
     sem["vacas_leite"] = s1.number_input("Vacas de Leite (qtd)", min_value=0, step=1, key="_w_sem_vacas_leite", placeholder="")
     sem["litros_dia"] = s2.number_input("Litros por Dia", min_value=0.0, step=5.0, key="_w_sem_litros_dia", placeholder="")
-    sem["preco_litro"] = s3.number_input("Preço por Litro (R$)", min_value=0.0, step=0.10, key="_w_sem_preco_litro", format="%.2f")
+    s3.text_input(
+        "Preço por Litro (R$)",
+        key="_w_sem_preco_litro",
+        on_change=cb_sync_sem_moeda,
+        args=("preco_litro",),
+        placeholder="Ex.: 2,45",
+    )
+    sem["preco_litro"] = parse_moeda_br(st.session_state.get("_w_sem_preco_litro"))
 
     s4, s5, s6 = st.columns(3)
     sem["boi_corte"] = s4.number_input("Boi de Corte (qtd)", min_value=0, step=1, key="_w_sem_boi_corte", placeholder="")
@@ -1908,19 +1990,31 @@ elif aba_ativa == "🌱 2. Análise Produtiva":
 
     re1, re2, re3, re4 = st.columns([2, 1, 2, 1])
     re1.text_input("Renda Extra 1 (Descrição)", key=preparar_widget("renda_extra_1_desc"), on_change=cb_sync_campo, args=("renda_extra_1_desc",))
-    re2.number_input("Valor Renda 1 (R$)", min_value=0.0, step=500.0, format="%.2f", key=preparar_widget("renda_extra_1_val"), on_change=cb_sync_campo, args=("renda_extra_1_val",))
+    re2.text_input(
+        "Valor Renda 1 (R$)",
+        key=preparar_widget_moeda("renda_extra_1_val"),
+        on_change=cb_sync_campo,
+        args=("renda_extra_1_val", False, True),
+        placeholder="Ex.: 10.000,00",
+    )
     re3.text_input("Renda Extra 2 (Descrição)", key=preparar_widget("renda_extra_2_desc"), on_change=cb_sync_campo, args=("renda_extra_2_desc",))
-    re4.number_input("Valor Renda 2 (R$)", min_value=0.0, step=500.0, format="%.2f", key=preparar_widget("renda_extra_2_val"), on_change=cb_sync_campo, args=("renda_extra_2_val",))
+    re4.text_input(
+        "Valor Renda 2 (R$)",
+        key=preparar_widget_moeda("renda_extra_2_val"),
+        on_change=cb_sync_campo,
+        args=("renda_extra_2_val", False, True),
+        placeholder="Ex.: 10.000,00",
+    )
 
     st.text_area("Relação de Bens (máquinas, veículos, benfeitorias)", key=preparar_widget("bens"), on_change=cb_sync_campo, args=("bens",), height=80)
 
     resumo_prod = montar_dicionario_proposta()
     with st.container(border=True):
-        st.markdown("#### 💵 Resumo da Renda Bruta Anual (Sai somado na impressão)")
+        st.markdown("#### 💵 Resumo da Renda Bruta Anual (Sai somado na impressão quando preenchido)")
         rp1, rp2, rp3 = st.columns(3)
-        rp1.markdown(f"**Soma Vendas 2026 (Propriedades):**\n\n### {fmt_moeda(resumo_prod['soma_vendas_2026'], vazio_se_zero=False)}")
-        rp2.markdown(f"**Soma Rendas Extras:**\n\n### {fmt_moeda(resumo_prod['soma_rendas_extras'], vazio_se_zero=False)}")
-        rp3.markdown(f"**RENDA BRUTA ANUAL TOTAL:**\n\n### {fmt_moeda(resumo_prod['renda_bruta_anual'], vazio_se_zero=False)}")
+        rp1.markdown(f"**Soma Vendas 2026 (Propriedades):**\n\n### {fmt_moeda(resumo_prod['soma_vendas_2026']) or '&nbsp;'}")
+        rp2.markdown(f"**Soma Rendas Extras:**\n\n### {fmt_moeda(resumo_prod['soma_rendas_extras']) or '&nbsp;'}")
+        rp3.markdown(f"**RENDA BRUTA ANUAL TOTAL:**\n\n### {fmt_moeda(resumo_prod['renda_bruta_anual']) or '&nbsp;'}")
 
 
 # ----------------------------------------------------------------------------
@@ -1960,26 +2054,20 @@ elif aba_ativa == "🧾 3. Ordem de Serviço & LGPD":
         args=("faixa_honorario_idx",),
         disabled=not liberado_desconto,
     )
-    os2.number_input(
+    os2.text_input(
         "Desconto Extra Manual (R$)",
-        min_value=0.0,
-        step=100.0,
-        format="%.2f",
-        key=preparar_widget("desconto_extra"),
+        key=preparar_widget_moeda("desconto_extra"),
         on_change=cb_sync_campo,
-        args=("desconto_extra",),
-        placeholder="",
+        args=("desconto_extra", False, True),
+        placeholder="Ex.: 500,00",
         disabled=not liberado_desconto,
     )
-    os3.number_input(
+    os3.text_input(
         "Acréscimos (R$)",
-        min_value=0.0,
-        step=100.0,
-        format="%.2f",
-        key=preparar_widget("acrescimos"),
+        key=preparar_widget_moeda("acrescimos"),
         on_change=cb_sync_campo,
-        args=("acrescimos",),
-        placeholder="",
+        args=("acrescimos", False, True),
+        placeholder="Ex.: 500,00",
     )
 
     if not tem_permissao("aplicar_desconto_os"):
@@ -2031,17 +2119,13 @@ elif aba_ativa == "🧾 3. Ordem de Serviço & LGPD":
 
     st.divider()
     st.subheader("🔒 Conferência do Termo LGPD (Proteção de Dados)")
-    banco_lgpd = d_calc["banco_destino"]
-    mun_lgpd = d_calc["banco_municipio"]
-    banco_lgpd_full = f"{banco_lgpd} — {mun_lgpd}" if (banco_lgpd and mun_lgpd) else (banco_lgpd or mun_lgpd)
-    inst_lgpd_txt = f"{banco_lgpd_full} (Instituições financeiras e cooperativas de crédito)" if banco_lgpd_full else "Instituições financeiras e cooperativas de crédito"
     cnpj_cont_txt = fmt_doc(d_calc["contabilidade_cnpj"])
     cont_linha = f"{d_calc['contabilidade_nome']} (CNPJ: {cnpj_cont_txt})" if (d_calc["contabilidade_nome"] and cnpj_cont_txt) else d_calc["contabilidade_nome"]
 
     st.info(
         f"**Titular:** {d_calc['cliente_nome']}  |  **CPF/CNPJ:** {fmt_doc(d_calc['cliente_cpf'])}\n\n"
         f"**Contabilidade:** {cont_linha}\n\n"
-        f"**Instituição Financeira / Abrangência:** {inst_lgpd_txt}"
+        "Este documento é válido para todas as instituições financeiras e cooperativas de crédito."
     )
 
     if tem_permissao("criar_editar_proposta"):
