@@ -72,43 +72,55 @@ st.set_page_config(
     layout="wide",
 )
 
-# Estilo moderno para a barra superior de páginas (sempre visível abaixo do cabeçalho do Streamlit)
+# Estilo moderno para a barra superior de páginas (visível e CONGELADA ao rolar a tela)
 st.markdown(
     """
     <style>
-    /* Garante espaço seguro abaixo da barra fixa do Streamlit Cloud (~3.75rem / 60px)
-       para os botões de navegação NUNCA ficarem escondidos no alto da tela */
+    /* 1. Espaço superior seguro abaixo do cabeçalho do Streamlit Cloud */
     .block-container,
     div[data-testid="stMainBlockContainer"] {
-        padding-top: 4.4rem !important;
+        padding-top: 4.1rem !important;
         padding-bottom: 2.5rem !important;
+        overflow: visible !important;
     }
 
-    /* Barra superior de navegação fixa (sticky) logo abaixo do cabeçalho do Streamlit */
-    div.st-key-barra_nav_topo,
-    div[class*="st-key-barra_nav_topo"] {
+    /* 2. Permite que a barra congelada (position: sticky) funcione em qualquer versão do Streamlit */
+    div[data-testid="stMainBlockContainer"] > div,
+    div[data-testid="stMainBlockContainer"] > div[data-testid="stVerticalBlock"],
+    div[data-testid="stMainBlockContainer"] > div > div[data-testid="stVerticalBlock"] {
+        overflow: visible !important;
+    }
+
+    /* 3. CONGELA a linha de botões de navegação no topo quando descer a barra de rolagem */
+    div[data-testid="stMainBlockContainer"] > div > div[data-testid="stVerticalBlock"] > div:has(div[class*="st-key-btn_nav_"]),
+    div[data-testid="stMainBlockContainer"] > div[data-testid="stVerticalBlock"] > div:has(div[class*="st-key-btn_nav_"]),
+    div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"]:has(div[class*="st-key-btn_nav_"]),
+    div[data-testid="stVerticalBlock"] > div[data-testid="stLayoutWrapper"]:has(div[class*="st-key-btn_nav_"]) {
         position: sticky !important;
-        top: 3.75rem !important;
-        z-index: 99 !important;
+        top: 3.65rem !important;
+        z-index: 999 !important;
         background-color: #FFFFFF !important;
-        padding: 0.5rem 0 0.55rem 0 !important;
+        padding: 0.5rem 0.25rem 0.6rem 0.25rem !important;
         margin-bottom: 0.75rem !important;
-        border-bottom: 2px solid #E2E8F0 !important;
+        border-bottom: 2px solid #CBD5E1 !important;
+        box-shadow: 0 4px 10px -4px rgba(15, 23, 42, 0.14) !important;
     }
 
-    /* Botões de navegação do topo — visual limpo e legível em 1 única linha */
+    /* 4. Visual dos botões de navegação do topo (1 linha, limpos e fáceis de clicar) */
     div[class*="st-key-btn_nav_"] button {
         border-radius: 9px !important;
-        padding: 0.45rem 0.25rem !important;
-        min-height: 2.55rem !important;
-        font-size: 0.85rem !important;
+        padding: 0.5rem 0.3rem !important;
+        min-height: 2.65rem !important;
+        font-size: 0.84rem !important;
         font-weight: 600 !important;
+        line-height: 1.15 !important;
         white-space: nowrap !important;
         transition: all 0.15s ease !important;
         box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06) !important;
     }
     div[class*="st-key-btn_nav_"] button p {
-        font-size: 0.85rem !important;
+        font-size: 0.84rem !important;
+        margin: 0 !important;
         white-space: nowrap !important;
     }
 
@@ -132,7 +144,7 @@ st.markdown(
         background-color: #166534 !important;
         border: 1px solid #14532D !important;
         color: #FFFFFF !important;
-        box-shadow: 0 2px 6px rgba(22, 101, 52, 0.25) !important;
+        box-shadow: 0 2px 6px rgba(22, 101, 52, 0.28) !important;
     }
     div[class*="st-key-btn_nav_"] button[data-testid="stBaseButton-primary"] p,
     div[class*="st-key-btn_nav_"] button[kind="primary"] p {
@@ -140,12 +152,13 @@ st.markdown(
         font-weight: 700 !important;
     }
 
-    /* Botões de avançar/voltar no rodapé das páginas */
+    /* 5. Botões de Voltar / Avançar no rodapé das páginas */
     div[class*="st-key-btn_rodape_prox_"] button {
         background-color: #166534 !important;
         border: 1px solid #14532D !important;
         color: #FFFFFF !important;
         border-radius: 10px !important;
+        min-height: 2.75rem !important;
         font-weight: 600 !important;
     }
     div[class*="st-key-btn_rodape_prox_"] button p {
@@ -153,6 +166,7 @@ st.markdown(
     }
     div[class*="st-key-btn_rodape_ant_"] button {
         border-radius: 10px !important;
+        min-height: 2.75rem !important;
         font-weight: 600 !important;
     }
     </style>
@@ -1651,25 +1665,19 @@ if "_nav_aba" not in st.session_state or st.session_state["_nav_aba"] not in tit
 
 aba_ativa = st.session_state["_nav_aba"]
 
-# Container sticky da barra superior (compatível com todas as versões do Streamlit)
-try:
-    barra_nav = st.container(key="barra_nav_topo")
-except TypeError:
-    barra_nav = st.container()
-
-with barra_nav:
-    cols_nav = st.columns(len(ABAS_DEFINICAO), gap="small")
-    for idx_aba, (id_aba, rotulo_curto, dica_aba) in enumerate(ABAS_DEFINICAO):
-        eh_atual = (aba_ativa == id_aba)
-        cols_nav[idx_aba].button(
-            rotulo_curto,
-            key=f"btn_nav_{idx_aba}",
-            type="primary" if eh_atual else "secondary",
-            help=dica_aba,
-            on_click=cb_ir_para_aba,
-            args=(id_aba,),
-            use_container_width=True,
-        )
+# Barra superior congelada (direto no fluxo principal, sem container extra, 100% compatível)
+cols_nav = st.columns(len(ABAS_DEFINICAO), gap="small")
+for idx_aba, (id_aba, rotulo_curto, dica_aba) in enumerate(ABAS_DEFINICAO):
+    eh_atual = (aba_ativa == id_aba)
+    cols_nav[idx_aba].button(
+        rotulo_curto,
+        key=f"btn_nav_{idx_aba}",
+        type="primary" if eh_atual else "secondary",
+        help=dica_aba,
+        on_click=cb_ir_para_aba,
+        args=(id_aba,),
+        use_container_width=True,
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -2993,9 +3001,8 @@ elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
 
 # ============================================================================
 # 9. ROLAGEM GARANTIDA AO TOPO DA TELA AO TROCAR DE PÁGINA
-#    Fica no final do script para rodar DEPOIS que a nova página foi desenhada,
-#    varrendo todos os containers roláveis do Streamlit (exceto a barra lateral)
-#    e repetindo após o ajuste de layout do navegador.
+#    Roda somente após clicar para trocar de página, zerando a barra de rolagem
+#    em todos os containers principais para a nova aba iniciar sempre no topo.
 # ============================================================================
 if st.session_state.pop("_rolar_para_topo", False):
     nonce_scroll = int(st.session_state.get("_scroll_nonce", 0))
@@ -3009,13 +3016,7 @@ if st.session_state.pop("_rolar_para_topo", False):
                     const win = window.parent;
                     const doc = win.document;
 
-                    // 1. Leva a âncora do topo absoluto para o início da tela
-                    const ancora = doc.getElementById("regularize-topo-pagina");
-                    if (ancora && typeof ancora.scrollIntoView === "function") {{
-                        ancora.scrollIntoView({{ behavior: "instant", block: "start" }});
-                    }}
-
-                    // 2. Zera scrollTop em todos os containers principais conhecidos do Streamlit
+                    // 1. Zera scrollTop em todos os containers principais conhecidos do Streamlit
                     const seletores = [
                         'section[data-testid="stMain"]',
                         'div[data-testid="stAppViewContainer"]',
@@ -3033,7 +3034,7 @@ if st.session_state.pop("_rolar_para_topo", False):
                         }});
                     }});
 
-                    // 3. Varre qualquer outro elemento rolável da área principal (sem mexer na sidebar)
+                    // 2. Varre qualquer outro elemento rolável fora da barra lateral
                     doc.querySelectorAll('section, div, main').forEach(function(el) {{
                         if (el.scrollTop > 0 && !el.closest('section[data-testid="stSidebar"]')) {{
                             el.scrollTop = 0;
@@ -3046,7 +3047,6 @@ if st.session_state.pop("_rolar_para_topo", False):
                 }} catch (e) {{}}
             }}
 
-            // Executa imediatamente e reforça após o navegador concluir o desenho da nova aba
             voltarAoTopo();
             if (window.parent && window.parent.requestAnimationFrame) {{
                 window.parent.requestAnimationFrame(voltarAoTopo);
