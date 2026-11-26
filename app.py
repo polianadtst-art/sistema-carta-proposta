@@ -746,19 +746,24 @@ def limpar_chaves_widgets():
             del st.session_state[k]
 
 
-def definir_campo(chave, valor):
-    """Atualiza tanto o dado principal quanto o widget correspondente (se visível)."""
+def definir_campo(chave, valor, atualizar_widget=True):
+    """Atualiza o dado principal e, quando permitido, o widget correspondente."""
     if chave in CAMPOS_MONETARIOS_ESCALARES:
         num = parse_moeda_br(valor)
         st.session_state[chave] = num
-        wk = f"_w_{chave}"
-        if wk in st.session_state:
-            st.session_state[wk] = fmt_input_moeda_br(num)
+        val_widget = fmt_input_moeda_br(num)
     else:
         st.session_state[chave] = valor
+        val_widget = valor
+
+    if atualizar_widget:
         wk = f"_w_{chave}"
         if wk in st.session_state:
-            st.session_state[wk] = valor
+            try:
+                st.session_state[wk] = val_widget
+            except Exception:
+                # Se o widget já foi desenhado nesta execução, mantém o estado principal atualizado sem erro
+                pass
 
 
 def preparar_widget(chave):
@@ -828,8 +833,11 @@ def cb_sync_sem_moeda(campo_s):
 
 def sincronizar_widgets_para_estado():
     """
-    Garante que TODOS os campos da aba atual sejam copiados dos widgets (_w_*)
-    para o estado principal ANTES de salvar ou trocar de aba.
+    Lê os valores atuais dos widgets (_w_*) para o estado principal ANTES de
+    salvar, gerar PDF ou trocar de aba.
+    IMPORTANTE: Nunca escreve de volta em st.session_state[wk] aqui, para evitar
+    StreamlitWidgetAlreadyInstantiatedError quando chamada no meio da página!
+    A formatação visual de volta no campo acontece apenas nos callbacks on_change.
     """
     # 1. Campos escalares
     for campo in CAMPOS_ESCALARES:
@@ -837,12 +845,9 @@ def sincronizar_widgets_para_estado():
         if wk in st.session_state:
             val = st.session_state[wk]
             if campo in ("cliente_cpf", "avalista_cpf", "conjuge_avalista_cpf"):
-                val = fmt_doc(val)
-                st.session_state[campo] = val
+                st.session_state[campo] = fmt_doc(val)
             elif campo in CAMPOS_MONETARIOS_ESCALARES:
-                num = parse_moeda_br(val)
-                st.session_state[campo] = num
-                st.session_state[wk] = fmt_input_moeda_br(num)
+                st.session_state[campo] = parse_moeda_br(val)
             else:
                 st.session_state[campo] = val
 
@@ -867,9 +872,7 @@ def sincronizar_widgets_para_estado():
             wk = f"_w_p_{pref}_{idx}"
             if wk in st.session_state:
                 if pref in ("v26", "v25", "v24"):
-                    num = parse_moeda_br(st.session_state[wk])
-                    p[campo_p] = num
-                    st.session_state[wk] = fmt_input_moeda_br(num)
+                    p[campo_p] = parse_moeda_br(st.session_state[wk])
                 else:
                     p[campo_p] = st.session_state[wk]
 
@@ -879,9 +882,7 @@ def sincronizar_widgets_para_estado():
         wk = f"_w_sem_{campo_s}"
         if wk in st.session_state:
             if campo_s == "preco_litro":
-                num = parse_moeda_br(st.session_state[wk])
-                sem[campo_s] = num
-                st.session_state[wk] = fmt_input_moeda_br(num)
+                sem[campo_s] = parse_moeda_br(st.session_state[wk])
             else:
                 sem[campo_s] = st.session_state[wk]
     st.session_state["semoventes"] = sem
@@ -1233,8 +1234,8 @@ def salvar_tudo_no_banco(silencioso=False):
         return None
 
     if not pode_dar_desconto_os():
-        definir_campo("faixa_honorario_idx", 2)
-        definir_campo("desconto_extra", None)
+        definir_campo("faixa_honorario_idx", 2, atualizar_widget=False)
+        definir_campo("desconto_extra", None, atualizar_widget=False)
 
     d = montar_dicionario_proposta()
     if len(d["cliente_cpf"]) not in (11, 14):
