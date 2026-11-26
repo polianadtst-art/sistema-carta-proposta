@@ -33,6 +33,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from sqlalchemy import create_engine, text
 
 from config import (
@@ -71,42 +72,69 @@ st.set_page_config(
     layout="wide",
 )
 
-# Estilo limpo para que a barra de navegação horizontal tenha visual de abas modernas
+# Estilo moderno para a barra superior de páginas (botões em 1 única linha, sem bolinhas)
 st.markdown(
     """
     <style>
-    div[data-testid="stRadio"] > div[role="radiogroup"] {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 6px;
-        border-bottom: 2px solid #E2E8F0;
-        padding-bottom: 8px;
-        margin-bottom: 12px;
+    /* Reduz excesso de espaço branco no topo da página */
+    .block-container {
+        padding-top: 1.6rem !important;
+        padding-bottom: 2.5rem !important;
     }
-    div[data-testid="stRadio"] > div[role="radiogroup"] label {
-        background-color: #F8FAFC;
-        border: 1px solid #CBD5E1;
-        border-radius: 8px;
-        padding: 6px 12px !important;
-        cursor: pointer;
-        transition: all 0.15s ease;
+
+    /* Botões de navegação do topo — visual limpo e compacto em 1 única linha */
+    div[class*="st-key-btn_nav_"] button {
+        border-radius: 10px !important;
+        padding: 0.45rem 0.4rem !important;
+        min-height: 2.55rem !important;
+        font-size: 0.90rem !important;
+        font-weight: 600 !important;
+        transition: all 0.15s ease !important;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05) !important;
     }
-    div[data-testid="stRadio"] > div[role="radiogroup"] label:hover {
-        border-color: #166534;
-        background-color: #F0FDF4;
+
+    /* Aba inativa */
+    div[class*="st-key-btn_nav_"] button[data-testid="stBaseButton-secondary"],
+    div[class*="st-key-btn_nav_"] button[kind="secondary"] {
+        background-color: #F8FAFC !important;
+        border: 1px solid #CBD5E1 !important;
+        color: #1E293B !important;
     }
-    div[data-testid="stRadio"] > div[role="radiogroup"] label:has(input:checked) {
-        background-color: #166534 !important;
+    div[class*="st-key-btn_nav_"] button[data-testid="stBaseButton-secondary"]:hover,
+    div[class*="st-key-btn_nav_"] button[kind="secondary"]:hover {
+        background-color: #F0FDF4 !important;
         border-color: #166534 !important;
-        color: #FFFFFF !important;
-        font-weight: 600;
+        color: #166534 !important;
     }
-    div[data-testid="stRadio"] > div[role="radiogroup"] label:has(input:checked) p {
+
+    /* Aba ativa (verde Regularize) */
+    div[class*="st-key-btn_nav_"] button[data-testid="stBaseButton-primary"],
+    div[class*="st-key-btn_nav_"] button[kind="primary"] {
+        background-color: #166534 !important;
+        border: 1px solid #14532D !important;
         color: #FFFFFF !important;
-        font-weight: 600;
+        box-shadow: 0 2px 6px rgba(22, 101, 52, 0.25) !important;
     }
-    div[data-testid="stRadio"] > div[role="radiogroup"] label > div:first-child {
-        display: none;
+    div[class*="st-key-btn_nav_"] button[data-testid="stBaseButton-primary"] p,
+    div[class*="st-key-btn_nav_"] button[kind="primary"] p {
+        color: #FFFFFF !important;
+        font-weight: 700 !important;
+    }
+
+    /* Botões de avançar/voltar no rodapé das páginas */
+    div[class*="st-key-btn_rodape_prox_"] button {
+        background-color: #166534 !important;
+        border: 1px solid #14532D !important;
+        color: #FFFFFF !important;
+        border-radius: 10px !important;
+        font-weight: 600 !important;
+    }
+    div[class*="st-key-btn_rodape_prox_"] button p {
+        color: #FFFFFF !important;
+    }
+    div[class*="st-key-btn_rodape_ant_"] button {
+        border-radius: 10px !important;
+        font-weight: 600 !important;
     }
     </style>
     """,
@@ -1485,6 +1513,38 @@ def cb_trocar_aba():
         st.session_state["_toast_autosave"] = f"⚠️ Aviso no salvamento automático: {exc}"
 
 
+def cb_ir_para_aba(nova_aba):
+    """Troca de página disparando o salvamento automático e marcando rolagem suave ao topo."""
+    if nova_aba == st.session_state.get("_nav_aba"):
+        return
+    cb_trocar_aba()
+    st.session_state["_nav_aba"] = nova_aba
+    st.session_state["_rolar_para_topo"] = True
+
+
+def renderizar_rodape_navegacao(aba_anterior=None, rotulo_ant="", aba_proxima=None, rotulo_prox=""):
+    """Exibe botões práticos de Voltar / Próxima Etapa no final da página (sem precisar rolar para cima)."""
+    st.divider()
+    c_ant, c_meio, c_prox = st.columns([1.4, 1.2, 1.4])
+    if aba_anterior:
+        c_ant.button(
+            f"⬅️ {rotulo_ant}",
+            key=f"btn_rodape_ant_{aba_anterior[:12]}",
+            on_click=cb_ir_para_aba,
+            args=(aba_anterior,),
+            use_container_width=True,
+        )
+    if aba_proxima:
+        c_prox.button(
+            f"{rotulo_prox} ➡️",
+            key=f"btn_rodape_prox_{aba_proxima[:12]}",
+            on_click=cb_ir_para_aba,
+            args=(aba_proxima,),
+            type="primary",
+            use_container_width=True,
+        )
+
+
 # ============================================================================
 # 7. INICIALIZAÇÃO, BARRA LATERAL E BARRA DE ABAS REATIVA
 # ============================================================================
@@ -1539,30 +1599,58 @@ with st.sidebar:
 
 
 # ============================================================================
-# 8. NAVEGAÇÃO PRINCIPAL POR ABAS REATIVAS (COM SALVAMENTO AUTOMÁTICO)
+# 8. NAVEGAÇÃO PRINCIPAL EM 1 ÚNICA LINHA (BOTÕES LIMPOS + SALVAMENTO AUTOMÁTICO)
 # ============================================================================
-titulos_abas = [
-    "📋 1. Nova Proposta & Cliente",
-    "🌱 2. Análise Produtiva",
-    "🧾 3. Ordem de Serviço & LGPD",
-    "🖨️ 4. Imprimir / PDFs (P&B)",
-    "🗂️ 5. Histórico & Cadastros",
+ABAS_DEFINICAO = [
+    ("📋 1. Nova Proposta & Cliente", "📋 1. Proposta", "Dados do cliente, propriedade, crédito, checklist e avalistas"),
+    ("🌱 2. Análise Produtiva", "🌱 2. Produção", "Propriedades, produção agrícola, semoventes, rendas e bens"),
+    ("🧾 3. Ordem de Serviço & LGPD", "🧾 3. OS & LGPD", "Honorários, descontos, forma de pagamento e conferência LGPD"),
+    ("🖨️ 4. Imprimir / PDFs (P&B)", "🖨️ 4. PDFs", "Pacotes bancários, documentos individuais e checklist em PDF"),
+    ("🗂️ 5. Histórico & Cadastros", "🗂️ 5. Histórico", "Histórico de propostas salvas, Excel e cadastro de contabilidades"),
 ]
 eh_admin_painel = tem_permissao("gerenciar_usuarios")
 if eh_admin_painel:
-    titulos_abas.append("🔐 6. Administração (Usuários)")
+    ABAS_DEFINICAO.append(
+        ("🔐 6. Administração (Usuários)", "🔐 6. Admin", "Gerenciar usuários ativos, senhas e tipos de autorizações")
+    )
 
+titulos_abas = [a[0] for a in ABAS_DEFINICAO]
 if "_nav_aba" not in st.session_state or st.session_state["_nav_aba"] not in titulos_abas:
     st.session_state["_nav_aba"] = titulos_abas[0]
 
-aba_ativa = st.radio(
-    "Navegação do Sistema",
-    options=titulos_abas,
-    horizontal=True,
-    label_visibility="collapsed",
-    key="_nav_aba",
-    on_change=cb_trocar_aba,
-)
+aba_ativa = st.session_state["_nav_aba"]
+
+# Barra superior limpa: todos os botões em 1 única linha, sem bolinhas de seleção!
+cols_nav = st.columns(len(ABAS_DEFINICAO), gap="small")
+for idx_aba, (id_aba, rotulo_curto, dica_aba) in enumerate(ABAS_DEFINICAO):
+    eh_atual = (aba_ativa == id_aba)
+    cols_nav[idx_aba].button(
+        rotulo_curto,
+        key=f"btn_nav_{idx_aba}",
+        type="primary" if eh_atual else "secondary",
+        help=dica_aba,
+        on_click=cb_ir_para_aba,
+        args=(id_aba,),
+        use_container_width=True,
+    )
+
+st.markdown("<hr style='margin: 6px 0 14px 0; border: none; border-top: 2px solid #E2E8F0;'>", unsafe_allow_html=True)
+
+# Ao trocar de página (ex.: pelo botão Próxima Etapa no rodapé), sobe automaticamente para o topo
+if st.session_state.pop("_rolar_para_topo", False):
+    components.html(
+        """
+        <script>
+        try {
+            const doc = window.parent.document;
+            const main = doc.querySelector('section[data-testid="stMain"]') || doc.querySelector('section.main');
+            if (main) main.scrollTo({top: 0, behavior: 'instant'});
+            window.parent.scrollTo(0, 0);
+        } catch(e) {}
+        </script>
+        """,
+        height=0,
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -1954,6 +2042,11 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
         height=75,
     )
 
+    renderizar_rodape_navegacao(
+        aba_proxima="🌱 2. Análise Produtiva",
+        rotulo_prox="Avançar para 2. Produção",
+    )
+
 
 # ----------------------------------------------------------------------------
 # ABA 2: ANÁLISE PRODUTIVA (COM R$ 0,00 E LINHA INTEIRA PARA NOME DA PROPRIEDADE)
@@ -2089,6 +2182,13 @@ elif aba_ativa == "🌱 2. Análise Produtiva":
         rp2.markdown(f"**Soma Rendas Extras:**\n\n### {fmt_moeda(resumo_prod['soma_rendas_extras']) or '&nbsp;'}")
         rp3.markdown(f"**RENDA BRUTA ANUAL TOTAL:**\n\n### {fmt_moeda(resumo_prod['renda_bruta_anual']) or '&nbsp;'}")
 
+    renderizar_rodape_navegacao(
+        aba_anterior="📋 1. Nova Proposta & Cliente",
+        rotulo_ant="Voltar: 1. Proposta",
+        aba_proxima="🧾 3. Ordem de Serviço & LGPD",
+        rotulo_prox="Avançar para 3. OS & LGPD",
+    )
+
 
 # ----------------------------------------------------------------------------
 # ABA 3: ORDEM DE SERVIÇO & LGPD
@@ -2209,6 +2309,13 @@ elif aba_ativa == "🧾 3. Ordem de Serviço & LGPD":
     else:
         st.warning("🔒 Seu perfil é Somente Consulta. Peça ao Administrador para liberar permissão de criação/edição.")
 
+    renderizar_rodape_navegacao(
+        aba_anterior="🌱 2. Análise Produtiva",
+        rotulo_ant="Voltar: 2. Produção",
+        aba_proxima="🖨️ 4. Imprimir / PDFs (P&B)",
+        rotulo_prox="Avançar para 4. PDFs",
+    )
+
 
 # ----------------------------------------------------------------------------
 # ABA 4: IMPRESSÃO / PDFs (P&B, MARGENS CONFORTÁVEIS, 1 FOLHA A4, MARCA D'ÁGUA)
@@ -2273,6 +2380,13 @@ elif aba_ativa == "🖨️ 4. Imprimir / PDFs (P&B)":
                 mime="application/pdf",
                 use_container_width=True,
             )
+
+    renderizar_rodape_navegacao(
+        aba_anterior="🧾 3. Ordem de Serviço & LGPD",
+        rotulo_ant="Voltar: 3. OS & LGPD",
+        aba_proxima="🗂️ 5. Histórico & Cadastros",
+        rotulo_prox="Ir para 5. Histórico",
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -2401,6 +2515,11 @@ elif aba_ativa == "🗂️ 5. Histórico & Cadastros":
                     st.rerun()
                 else:
                     st.warning("Informe o nome da contabilidade.")
+
+    renderizar_rodape_navegacao(
+        aba_anterior="📋 1. Nova Proposta & Cliente",
+        rotulo_ant="Voltar para 1. Proposta",
+    )
 
 
 # ----------------------------------------------------------------------------
