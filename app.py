@@ -72,25 +72,44 @@ st.set_page_config(
     layout="wide",
 )
 
-# Estilo moderno para a barra superior de páginas (botões em 1 única linha, sem bolinhas)
+# Estilo moderno para a barra superior de páginas (sempre visível abaixo do cabeçalho do Streamlit)
 st.markdown(
     """
     <style>
-    /* Reduz excesso de espaço branco no topo da página */
-    .block-container {
-        padding-top: 1.6rem !important;
+    /* Garante espaço seguro abaixo da barra fixa do Streamlit Cloud (~3.75rem / 60px)
+       para os botões de navegação NUNCA ficarem escondidos no alto da tela */
+    .block-container,
+    div[data-testid="stMainBlockContainer"] {
+        padding-top: 4.4rem !important;
         padding-bottom: 2.5rem !important;
     }
 
-    /* Botões de navegação do topo — visual limpo e compacto em 1 única linha */
+    /* Barra superior de navegação fixa (sticky) logo abaixo do cabeçalho do Streamlit */
+    div.st-key-barra_nav_topo,
+    div[class*="st-key-barra_nav_topo"] {
+        position: sticky !important;
+        top: 3.75rem !important;
+        z-index: 99 !important;
+        background-color: #FFFFFF !important;
+        padding: 0.5rem 0 0.55rem 0 !important;
+        margin-bottom: 0.75rem !important;
+        border-bottom: 2px solid #E2E8F0 !important;
+    }
+
+    /* Botões de navegação do topo — visual limpo e legível em 1 única linha */
     div[class*="st-key-btn_nav_"] button {
-        border-radius: 10px !important;
-        padding: 0.45rem 0.4rem !important;
+        border-radius: 9px !important;
+        padding: 0.45rem 0.25rem !important;
         min-height: 2.55rem !important;
-        font-size: 0.90rem !important;
+        font-size: 0.85rem !important;
         font-weight: 600 !important;
+        white-space: nowrap !important;
         transition: all 0.15s ease !important;
-        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05) !important;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06) !important;
+    }
+    div[class*="st-key-btn_nav_"] button p {
+        font-size: 0.85rem !important;
+        white-space: nowrap !important;
     }
 
     /* Aba inativa */
@@ -960,6 +979,7 @@ def cb_limpar_formulario():
             del st.session_state[k]
     inicializar_estado_proposta()
     st.session_state["_nav_aba"] = "📋 1. Nova Proposta & Cliente"
+    _solicitar_rolagem_topo()
 
 
 def cb_ao_trocar_servico(catalogo):
@@ -1133,6 +1153,7 @@ def cb_carregar_proposta(proposta_id):
     # Marca o estado carregado como já salvo (evita gravação desnecessária antes de editar)
     st.session_state["_ultimo_hash_salvo"] = _calcular_hash_proposta(montar_dicionario_proposta())
     st.session_state["_nav_aba"] = "📋 1. Nova Proposta & Cliente"
+    _solicitar_rolagem_topo()
 
 
 # ============================================================================
@@ -1513,13 +1534,20 @@ def cb_trocar_aba():
         st.session_state["_toast_autosave"] = f"⚠️ Aviso no salvamento automático: {exc}"
 
 
+def _solicitar_rolagem_topo():
+    """Agenda rolagem garantida ao topo da tela com identificador único (nunca ignorado pelo navegador)."""
+    st.session_state["_rolar_para_topo"] = True
+    st.session_state["_scroll_nonce"] = int(st.session_state.get("_scroll_nonce", 0)) + 1
+
+
 def cb_ir_para_aba(nova_aba):
-    """Troca de página disparando o salvamento automático e marcando rolagem suave ao topo."""
+    """Troca de página disparando o salvamento automático e rolando a nova página para o alto da tela."""
     if nova_aba == st.session_state.get("_nav_aba"):
+        _solicitar_rolagem_topo()
         return
     cb_trocar_aba()
     st.session_state["_nav_aba"] = nova_aba
-    st.session_state["_rolar_para_topo"] = True
+    _solicitar_rolagem_topo()
 
 
 def renderizar_rodape_navegacao(aba_anterior=None, rotulo_ant="", aba_proxima=None, rotulo_prox=""):
@@ -1599,8 +1627,11 @@ with st.sidebar:
 
 
 # ============================================================================
-# 8. NAVEGAÇÃO PRINCIPAL EM 1 ÚNICA LINHA (BOTÕES LIMPOS + SALVAMENTO AUTOMÁTICO)
+# 8. NAVEGAÇÃO PRINCIPAL EM 1 ÚNICA LINHA (SEMPRE VISÍVEL + SALVAMENTO AUTOMÁTICO)
 # ============================================================================
+# Âncora invisível no topo absoluto da página para a rolagem automática voltar ao início
+st.markdown('<div id="regularize-topo-pagina" style="height:1px; margin:0; padding:0;"></div>', unsafe_allow_html=True)
+
 ABAS_DEFINICAO = [
     ("📋 1. Nova Proposta & Cliente", "📋 1. Proposta", "Dados do cliente, propriedade, crédito, checklist e avalistas"),
     ("🌱 2. Análise Produtiva", "🌱 2. Produção", "Propriedades, produção agrícola, semoventes, rendas e bens"),
@@ -1620,37 +1651,25 @@ if "_nav_aba" not in st.session_state or st.session_state["_nav_aba"] not in tit
 
 aba_ativa = st.session_state["_nav_aba"]
 
-# Barra superior limpa: todos os botões em 1 única linha, sem bolinhas de seleção!
-cols_nav = st.columns(len(ABAS_DEFINICAO), gap="small")
-for idx_aba, (id_aba, rotulo_curto, dica_aba) in enumerate(ABAS_DEFINICAO):
-    eh_atual = (aba_ativa == id_aba)
-    cols_nav[idx_aba].button(
-        rotulo_curto,
-        key=f"btn_nav_{idx_aba}",
-        type="primary" if eh_atual else "secondary",
-        help=dica_aba,
-        on_click=cb_ir_para_aba,
-        args=(id_aba,),
-        use_container_width=True,
-    )
+# Container sticky da barra superior (compatível com todas as versões do Streamlit)
+try:
+    barra_nav = st.container(key="barra_nav_topo")
+except TypeError:
+    barra_nav = st.container()
 
-st.markdown("<hr style='margin: 6px 0 14px 0; border: none; border-top: 2px solid #E2E8F0;'>", unsafe_allow_html=True)
-
-# Ao trocar de página (ex.: pelo botão Próxima Etapa no rodapé), sobe automaticamente para o topo
-if st.session_state.pop("_rolar_para_topo", False):
-    components.html(
-        """
-        <script>
-        try {
-            const doc = window.parent.document;
-            const main = doc.querySelector('section[data-testid="stMain"]') || doc.querySelector('section.main');
-            if (main) main.scrollTo({top: 0, behavior: 'instant'});
-            window.parent.scrollTo(0, 0);
-        } catch(e) {}
-        </script>
-        """,
-        height=0,
-    )
+with barra_nav:
+    cols_nav = st.columns(len(ABAS_DEFINICAO), gap="small")
+    for idx_aba, (id_aba, rotulo_curto, dica_aba) in enumerate(ABAS_DEFINICAO):
+        eh_atual = (aba_ativa == id_aba)
+        cols_nav[idx_aba].button(
+            rotulo_curto,
+            key=f"btn_nav_{idx_aba}",
+            type="primary" if eh_atual else "secondary",
+            help=dica_aba,
+            on_click=cb_ir_para_aba,
+            args=(id_aba,),
+            use_container_width=True,
+        )
 
 
 # ----------------------------------------------------------------------------
@@ -2970,3 +2989,74 @@ elif aba_ativa == "🔐 6. Administração (Usuários)" and eh_admin_painel:
                                     st.rerun()
                                 else:
                                     st.error("❌ Senha do Administrador incorreta.")
+
+
+# ============================================================================
+# 9. ROLAGEM GARANTIDA AO TOPO DA TELA AO TROCAR DE PÁGINA
+#    Fica no final do script para rodar DEPOIS que a nova página foi desenhada,
+#    varrendo todos os containers roláveis do Streamlit (exceto a barra lateral)
+#    e repetindo após o ajuste de layout do navegador.
+# ============================================================================
+if st.session_state.pop("_rolar_para_topo", False):
+    nonce_scroll = int(st.session_state.get("_scroll_nonce", 0))
+    components.html(
+        f"""
+        <!-- regularize-scroll-top-{nonce_scroll} -->
+        <script>
+        (function() {{
+            function voltarAoTopo() {{
+                try {{
+                    const win = window.parent;
+                    const doc = win.document;
+
+                    // 1. Leva a âncora do topo absoluto para o início da tela
+                    const ancora = doc.getElementById("regularize-topo-pagina");
+                    if (ancora && typeof ancora.scrollIntoView === "function") {{
+                        ancora.scrollIntoView({{ behavior: "instant", block: "start" }});
+                    }}
+
+                    // 2. Zera scrollTop em todos os containers principais conhecidos do Streamlit
+                    const seletores = [
+                        'section[data-testid="stMain"]',
+                        'div[data-testid="stAppViewContainer"]',
+                        'div[data-testid="stMainBlockContainer"]',
+                        'div[data-testid="stApp"]',
+                        'section.main',
+                        'main'
+                    ];
+                    seletores.forEach(function(sel) {{
+                        doc.querySelectorAll(sel).forEach(function(el) {{
+                            el.scrollTop = 0;
+                            if (typeof el.scrollTo === "function") {{
+                                el.scrollTo(0, 0);
+                            }}
+                        }});
+                    }});
+
+                    // 3. Varre qualquer outro elemento rolável da área principal (sem mexer na sidebar)
+                    doc.querySelectorAll('section, div, main').forEach(function(el) {{
+                        if (el.scrollTop > 0 && !el.closest('section[data-testid="stSidebar"]')) {{
+                            el.scrollTop = 0;
+                        }}
+                    }});
+
+                    if (doc.documentElement) doc.documentElement.scrollTop = 0;
+                    if (doc.body) doc.body.scrollTop = 0;
+                    win.scrollTo(0, 0);
+                }} catch (e) {{}}
+            }}
+
+            // Executa imediatamente e reforça após o navegador concluir o desenho da nova aba
+            voltarAoTopo();
+            if (window.parent && window.parent.requestAnimationFrame) {{
+                window.parent.requestAnimationFrame(voltarAoTopo);
+            }}
+            setTimeout(voltarAoTopo, 60);
+            setTimeout(voltarAoTopo, 180);
+            setTimeout(voltarAoTopo, 350);
+            setTimeout(voltarAoTopo, 600);
+        }})();
+        </script>
+        """,
+        height=0,
+    )
