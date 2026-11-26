@@ -1,5 +1,5 @@
 # ============================================================================
-# ARQUIVO: config.py (Versão 9.0 — Regularize Assessoria Rural)
+# ARQUIVO: config.py (Versão 12.0 — Regularize Assessoria Rural)
 # O QUE ESTE ARQUIVO FAZ:
 #   Centraliza TODAS as configurações da Regularize Assessoria Rural com
 #   todas as listas selecionáveis organizadas em ORDEM ALFABÉTICA (A–Z, PT-BR):
@@ -469,6 +469,7 @@ TODOS_OS_DOCUMENTOS = [
     'BB CONJUGE AVAL',
     'BRADESCO',
     'CAIXA',
+    'CHECKLIST DE DOCUMENTOS',
     'CRESOL',
     'GALPÃO DE GRÃOS',
     'INVEST CAIXA',

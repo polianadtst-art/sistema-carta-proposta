@@ -1,5 +1,5 @@
 # ============================================================================
-# ARQUIVO: pdf_generator.py (Versão 4.0 — Regularize Assessoria Rural)
+# ARQUIVO: pdf_generator.py (Versão 12.0 — Regularize Assessoria Rural)
 # O QUE ESTE ARQUIVO FAZ:
 #   Gera TODOS os 23 documentos oficiais em PDF (100% Preto e Branco):
 #   - Margens confortáveis (1,4 cm nas laterais e 1,3 cm no topo/rodapé)
@@ -1126,6 +1126,116 @@ def doc_galpao_graos(d, est):
 
 
 # ============================================================================
+# 5B. CHECKLIST DE DOCUMENTOS NECESSÁRIOS (PARA ENTREGAR AO CLIENTE — 1 FOLHA A4)
+#     Funciona tanto em branco (quando o cliente passa no escritório perguntando
+#     quais documentos precisa providenciar) quanto já preenchido com os dados
+#     e marcações da proposta atual!
+# ============================================================================
+def doc_checklist_documentos(d, est):
+    W = LARGURA_UTIL
+    g_cab = bloco_cabecalho_planilha(
+        "CHECKLIST DE DOCUMENTOS NECESSÁRIOS",
+        est,
+        "Relação de Documentos para Instrução de Crédito Rural / Regularização",
+    )
+
+    # Quadro de identificação (campos vazios ficam em branco para preencher à mão se for atendimento rápido)
+    serv_txt = safe(d.get("tipo_servico"))
+    item_txt = safe(d.get("item_financiado"))
+    linha_serv = f"{serv_txt} — {item_txt}" if (serv_txt and item_txt) else (serv_txt or item_txt)
+
+    banco_nome_p = safe(d.get("banco_destino"))
+    banco_mun_p = safe(d.get("banco_municipio"))
+    banco_full = f"{banco_nome_p} — {banco_mun_p}" if (banco_nome_p and banco_mun_p) else (banco_nome_p or banco_mun_p)
+
+    g_id = [
+        faixa_secao("IDENTIFICAÇÃO DO PROPONENTE E OPERAÇÃO", est),
+        tabela_pb([
+            [
+                Paragraph(f"<b>Produtor / Cliente:</b> {safe(d.get('cliente_nome'))}", est["normal"]),
+                Paragraph(f"<b>Data:</b> {fmt_data_br(d.get('data_proposta'))}", est["normal"]),
+            ],
+            [
+                Paragraph(f"<b>CPF/CNPJ:</b> {fmt_doc(d.get('cliente_cpf'))}", est["normal"]),
+                Paragraph(f"<b>Telefone / WhatsApp:</b> {safe(d.get('cliente_telefone'))}", est["normal"]),
+            ],
+            [
+                Paragraph(f"<b>Linha / Serviço:</b> {linha_serv}", est["normal"]),
+                Paragraph(f"<b>Banco / Cooperativa:</b> {banco_full}", est["normal"]),
+            ],
+            [
+                Paragraph(f"<b>Imóvel Beneficiado:</b> {safe(d.get('imovel_beneficiado_texto'))}", est["normal"]),
+                Paragraph(f"<b>Enquadramento:</b> {safe(d.get('tipo_cliente'))}", est["normal"]),
+            ],
+        ], [11.2 * cm, 7.0 * cm], est, pad_v=4.0),
+    ]
+
+    chk = d.get("checklist_docs") or {}
+
+    def _tabela_grupo_docs(titulo_grupo, lista_itens, prefixo_chave):
+        linhas = [[
+            Paragraph("<b>Status</b>", est["centro_bold"]),
+            Paragraph(f"<b>{safe(titulo_grupo)}</b>", est["normal_bold"]),
+            Paragraph("<b>Observações / Pendências</b>", est["normal_bold"]),
+        ]]
+        for item in lista_itens:
+            marcado = bool(chk.get(f"{prefixo_chave}_{item}", False))
+            caixa = "[ <b>X</b> ]" if marcado else "[ &nbsp;&nbsp; ]"
+            linhas.append([
+                Paragraph(caixa, est["centro"]),
+                Paragraph(safe(item), est["normal"]),
+                Paragraph("", est["normal"]),
+            ])
+        t = Table(linhas, colWidths=[1.8 * cm, 9.4 * cm, 7.0 * cm])
+        t.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.55, est["cor_borda"]),
+            ("BACKGROUND", (0, 0), (-1, 0), est["cor_faixa"]),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 3.4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3.4),
+            ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
+        ]))
+        return t
+
+    g_prop = [_tabela_grupo_docs("1. DOCUMENTOS DO PROPONENTE", DOCS_PROPONENTE, "prop")]
+    g_imov = [_tabela_grupo_docs("2. DOCUMENTOS DO IMÓVEL RURAL", DOCS_IMOVEL, "imov")]
+    g_coob = [_tabela_grupo_docs("3. DOCUMENTOS DOS COOBRIGADOS / AVALISTAS (SE HOUVER)", DOCS_COOBRIGADOS, "coob")]
+
+    # Rodapé com orientações de envio e contatos do escritório Regularize
+    cont_nome = safe(d.get("contabilidade_nome"))
+    g_rod = [
+        faixa_secao("ORIENTAÇÕES E CONTATO DO ESCRITÓRIO PARA ENVIO DOS DOCUMENTOS", est),
+        tabela_pb([
+            [
+                Paragraph(
+                    "• <b>Documentos pessoais e do imóvel:</b> enviar fotos nítidas (frente e verso) ou arquivos PDF legíveis.<br/>"
+                    "• <b>Comprovante de endereço e Certidão de Inteiro Teor:</b> devem estar atualizados (emitidos há menos de 30 dias).<br/>"
+                    f"• <b>Contabilidade indicada:</b> {cont_nome}",
+                    est["pequeno"],
+                ),
+            ],
+            [
+                Paragraph(
+                    f"<b>{safe(EMPRESA['razao_social'].upper())}</b> — {safe(EMPRESA['endereco_completo'])}<br/>"
+                    f"<b>WhatsApp / Telefones:</b> {safe(EMPRESA['telefones'])} &nbsp;&nbsp;|&nbsp;&nbsp; "
+                    f"<b>E-mail:</b> {safe(EMPRESA['email'])}",
+                    est["centro"],
+                ),
+            ],
+        ], [W], est, pad_v=4.5),
+    ]
+
+    elementos = distribuir_secoes_equilibrado(
+        [g_cab, g_id, g_prop, g_imov, g_coob, g_rod],
+        peso_lacunas=[0.6, 0.8, 0.8, 0.8, 1.0],
+        max_lacuna_cm=0.7,
+    )
+    return [enquadrar_uma_folha(elementos)]
+
+
+# ============================================================================
 # 6 a 23. FORMULÁRIOS BANCÁRIOS (MARGENS CONFORTÁVEIS E DISTRIBUIÇÃO EQUILIBRADA)
 # ============================================================================
 def doc_autorizacao_compartilhamento(d, est, banco_nome, parceira_txt):
@@ -1473,6 +1583,8 @@ def gerar_pdf_bytes(dados_proposta, lista_documentos):
             story.extend(doc_protecao_dados(dados_proposta, est))
         elif nome_doc == "GALPÃO DE GRÃOS":
             story.extend(doc_galpao_graos(dados_proposta, est))
+        elif nome_doc == "CHECKLIST DE DOCUMENTOS":
+            story.extend(doc_checklist_documentos(dados_proposta, est))
         elif nome_doc == "SICOOB BNDES":
             story.extend(doc_sicoob_bndes(dados_proposta, est))
         elif nome_doc == "AUTORIZAÇÃO SICOOB":

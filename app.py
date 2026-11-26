@@ -1860,6 +1860,25 @@ if aba_ativa == "📋 1. Nova Proposta & Cliente":
             chk[chave] = st.checkbox(doc_nome, key=wk)
     st.session_state["checklist_docs"] = chk
 
+    # Botão rápido de impressão do Checklist de Documentos (para entregar ao cliente no atendimento)
+    if tem_permissao("gerar_pdf"):
+        sincronizar_widgets_para_estado()
+        d_chk_pdf = montar_dicionario_proposta()
+        nome_arq_chk = re.sub(r"[^A-Za-z0-9_-]+", "_", d_chk_pdf["cliente_nome"] or "CLIENTE").strip("_")
+        pdf_chk_bytes = gerar_pdf_bytes(d_chk_pdf, ["CHECKLIST DE DOCUMENTOS"])
+        c_chk_btn, c_chk_info = st.columns([1.6, 2.4])
+        c_chk_btn.download_button(
+            label="🖨️ Baixar / Imprimir Checklist de Documentos (PDF)",
+            data=pdf_chk_bytes,
+            file_name=f"CHECKLIST_DOCUMENTOS_{nome_arq_chk}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+        c_chk_info.caption(
+            "💡 Dica: gera uma folha A4 em Preto e Branco pronta para imprimir e entregar ao cliente "
+            "(funciona mesmo em branco ou já com os itens marcados acima)."
+        )
+
     # MARGEM CRÉDITO PESSOAL E AVALISTAS SEPARADOS
     st.divider()
     col_margem, col_aval = st.columns(2)
@@ -2212,7 +2231,7 @@ elif aba_ativa == "🖨️ 4. Imprimir / PDFs (P&B)":
             st.markdown("### 📦 Pacote Completo por Instituição")
             opcoes_pacotes_ord = ordenar_alfabetico_ptbr(list(PACOTES_BANCOS.keys()))
             banco_pacote = st.selectbox("Escolha o Pacote Bancário:", opcoes_pacotes_ord)
-            opcoes_docs_cli_ord = ordenar_alfabetico_ptbr(DOCUMENTOS_CLIENTE_PADRAO + ["GALPÃO DE GRÃOS"])
+            opcoes_docs_cli_ord = ordenar_alfabetico_ptbr(DOCUMENTOS_CLIENTE_PADRAO + ["GALPÃO DE GRÃOS", "CHECKLIST DE DOCUMENTOS"])
             incluir_abas_cliente = st.multiselect(
                 "Quais documentos do cliente incluir no início do pacote?",
                 options=opcoes_docs_cli_ord,
@@ -2244,7 +2263,7 @@ elif aba_ativa == "🖨️ 4. Imprimir / PDFs (P&B)":
 
         with col_ind:
             st.markdown("### 📄 Documento Individual (1 Folha A4)")
-            doc_avulso = st.selectbox("Escolha qualquer um dos 23 documentos:", ordenar_alfabetico_ptbr(TODOS_OS_DOCUMENTOS))
+            doc_avulso = st.selectbox(f"Escolha qualquer um dos {len(TODOS_OS_DOCUMENTOS)} documentos:", ordenar_alfabetico_ptbr(TODOS_OS_DOCUMENTOS))
             pdf_avulso = gerar_pdf_bytes(d_pdf, [doc_avulso])
             st.download_button(
                 label=f"📥 Baixar PDF Individual (P&B) — {doc_avulso}",
